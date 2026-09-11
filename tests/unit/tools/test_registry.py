@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
+
 from code_review_agent.adapters.tools.registry import (
     ToolManifestError,
     ToolRegistry,
@@ -12,7 +14,7 @@ from code_review_agent.adapters.tools.registry import (
 
 from .conftest import tool_manifest
 
-ALL_ALLOWED_RULES = (
+ALL_ALLOWED_RULES: tuple[dict[str, Any], ...] = (
     {
         "id": "literal",
         "op": "literal_contains",

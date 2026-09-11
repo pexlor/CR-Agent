@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import fields, replace
 from pathlib import Path
+from typing import Any
 
 import pytest
+
 from code_review_agent.adapters.tools.registry import ToolRegistry
 from code_review_agent.adapters.tools.runtime import RestrictedToolRuntime
 from code_review_agent.ports.tools import (
     AuthorizedToolInput,
+    ToolDeclaration,
     ToolExecutionContext,
     ToolExecutionState,
 )
@@ -17,8 +21,8 @@ from .test_registry import ALL_ALLOWED_RULES
 
 
 def _runtime(
-    *, rules: tuple[dict[str, object], ...] = ALL_ALLOWED_RULES
-) -> tuple[RestrictedToolRuntime, object]:
+    *, rules: Sequence[Mapping[str, Any]] = ALL_ALLOWED_RULES
+) -> tuple[RestrictedToolRuntime, ToolDeclaration]:
     registry = ToolRegistry()
     declaration = registry.register_toml(tool_manifest(rules=rules))[0]
     registry.freeze()
@@ -42,7 +46,7 @@ def test_runtime_executes_every_allowed_operation_as_inert_data() -> None:
     text = "\n".join(
         (
             "TODO: auth (",
-            'disable eval subprocess.run(password log, mode("unsafe"));',
+            'disable eval(user) subprocess.run(password log, mode("unsafe"));',
             "DEBUG",
             "ordinary line",
             "danger unsafe",
