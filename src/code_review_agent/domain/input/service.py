@@ -305,8 +305,10 @@ class _UnifiedDiffParser:
                 recognized_fact = True
                 continue
             if body.startswith("--- "):
-                if index + 1 >= len(lines) or not lines[index + 1].body.startswith(
-                    "+++ "
+                if (
+                    has_markers
+                    or index + 1 >= len(lines)
+                    or not lines[index + 1].body.startswith("+++ ")
                 ):
                     raise _MalformedDiff
                 marker_old = _parse_marker_path(lines[index].body[4:], "a/")
@@ -366,6 +368,8 @@ class _UnifiedDiffParser:
             raise _MalformedDiff
         if binary_paths is not None:
             binary_old, binary_new = binary_paths
+            if has_markers and (marker_old != binary_old or marker_new != binary_new):
+                raise _MalformedDiff
             if binary_old is not None and binary_old != header_old:
                 raise _MalformedDiff
             if binary_new is not None and binary_new != header_new:
