@@ -21,8 +21,8 @@ from code_review_agent.domain.execution.models import (
 )
 from code_review_agent.ports.model import ModelGatewayPort
 
-_AUTH_HEADERS = frozenset(
-    {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+_FIXED_HEADER_ALLOWLIST = frozenset(
+    {"accept", "content-type", "anthropic-version", "anthropic-beta"}
 )
 
 
@@ -57,7 +57,7 @@ def assert_provider_preparation_contract(
         assert prepared.method == capabilities.request_method
         assert prepared.path == capabilities.request_path
         assert dict(prepared.headers) == dict(capabilities.fixed_headers)
-        assert not (_AUTH_HEADERS & prepared.headers.keys())
+        assert prepared.headers.keys() <= _FIXED_HEADER_ALLOWLIST
         assert prepared.strategy is options.strategy
         assert prepared.output_token_max == options.max_output_tokens
         assert provider.owns_prepared_request(prepared)

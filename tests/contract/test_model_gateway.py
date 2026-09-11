@@ -274,6 +274,7 @@ def test_fixed_protocol_header_is_allowed() -> None:
         "https://model.example.test?tenant=user-input",
         "https://model.example.test#fragment",
         "https://model.example.test:8443",
+        "https://model example.test",
         "https://",
     ),
 )
@@ -801,9 +802,7 @@ async def test_invalid_provider_return_becomes_unknown_and_settles_reservation()
     None
 ):
     class InvalidReturnProvider(FakeModelProvider):
-        async def send_prepared(
-            self, request: PreparedModelRequest
-        ) -> Any:
+        async def send_prepared(self, request: PreparedModelRequest) -> Any:
             self.discard_prepared(request)
             self.send_calls += 1
             return cast(Any, {"secret": "credential=top-secret"})
