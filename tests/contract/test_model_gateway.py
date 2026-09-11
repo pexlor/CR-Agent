@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
@@ -232,6 +233,27 @@ def test_fixed_protocol_header_is_allowed() -> None:
     )
 
     assert value.fixed_headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    tuple(
+        (field, invalid_value)
+        for field in (
+            "preflight_token_counting",
+            "usage_mapping_trusted",
+            "streaming_disabled",
+            "retries_disabled",
+            "dynamic_tools_disabled",
+        )
+        for invalid_value in ("false", 1)
+    ),
+)
+def test_model_capability_flags_require_real_booleans(
+    field: str, invalid_value: object
+) -> None:
+    with pytest.raises(TypeError, match="bool"):
+        capability_with_invalid_flag(field, invalid_value)
 
 
 @pytest.mark.asyncio
@@ -582,3 +604,19 @@ def successful_provider(usage: ModelUsage) -> FakeModelProvider:
             ),
         ),
     )
+
+
+def capability_with_invalid_flag(
+    field: str, invalid_value: object
+) -> ModelCapabilities:
+    baseline = capabilities()
+    value = cast(Any, invalid_value)
+    if field == "preflight_token_counting":
+        return replace(baseline, preflight_token_counting=value)
+    if field == "usage_mapping_trusted":
+        return replace(baseline, usage_mapping_trusted=value)
+    if field == "streaming_disabled":
+        return replace(baseline, streaming_disabled=value)
+    if field == "retries_disabled":
+        return replace(baseline, retries_disabled=value)
+    return replace(baseline, dynamic_tools_disabled=value)
