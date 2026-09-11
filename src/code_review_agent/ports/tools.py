@@ -13,22 +13,81 @@ type RuleParameter = str | int | tuple[str, ...]
 SHA256_HEX_LENGTH = 64
 
 
-def deterministic_tool_token_count(text: str) -> int:
-    """Count finite-language tokens without trusting caller-provided metadata."""
+@dataclass(frozen=True, slots=True)
+class ToolToken:
+    value: str
+    kind: str
+    line: int
+    column: int
+
+
+def deterministic_tool_tokens(text: str) -> tuple[ToolToken, ...]:
+    """Lex text once for both resource limits and finite-language operations."""
 
     if not isinstance(text, str):
         raise TypeError("text must be a string")
-    count = 0
-    in_identifier = False
-    for char in text:
-        is_identifier = char.isalnum() or char == "_"
-        if is_identifier:
-            if not in_identifier:
-                count += 1
-        elif not char.isspace():
-            count += 1
-        in_identifier = is_identifier
-    return count
+    tokens: list[ToolToken] = []
+    offset = 0
+    line = 1
+    column = 1
+    while offset < len(text):
+        char = text[offset]
+        if char == "\n":
+            offset += 1
+            line += 1
+            column = 1
+            continue
+        if char.isspace():
+            offset += 1
+            column += 1
+            continue
+        start_line, start_column = line, column
+        if char.isalpha() or char == "_":
+            start = offset
+            while offset < len(text) and (
+                text[offset].isalnum() or text[offset] == "_"
+            ):
+                offset += 1
+                column += 1
+            tokens.append(
+                ToolToken(text[start:offset], "identifier", start_line, start_column)
+            )
+            continue
+        if char in ("'", '"'):
+            delimiter = char * 3 if text.startswith(char * 3, offset) else char
+            offset += len(delimiter)
+            column += len(delimiter)
+            literal: list[str] = []
+            while offset < len(text) and not text.startswith(delimiter, offset):
+                current = text[offset]
+                if current == "\\" and offset + 1 < len(text):
+                    offset += 1
+                    column += 1
+                    current = text[offset]
+                literal.append(current)
+                offset += 1
+                if current == "\n":
+                    line += 1
+                    column = 1
+                else:
+                    column += 1
+            if offset < len(text):
+                offset += len(delimiter)
+                column += len(delimiter)
+            tokens.append(
+                ToolToken("".join(literal), "string", start_line, start_column)
+            )
+            continue
+        tokens.append(ToolToken(char, "punctuation", start_line, start_column))
+        offset += 1
+        column += 1
+    return tuple(tokens)
+
+
+def deterministic_tool_token_count(text: str) -> int:
+    """Count exactly the tokens consumed by the restricted runtime lexer."""
+
+    return len(deterministic_tool_tokens(text))
 
 
 def _is_sha256(value: str) -> bool:

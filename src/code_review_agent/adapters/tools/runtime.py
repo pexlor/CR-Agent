@@ -20,7 +20,9 @@ from code_review_agent.ports.tools import (
     ToolExecutionResult,
     ToolExecutionState,
     ToolLimits,
+    ToolToken,
     deterministic_tool_token_count,
+    deterministic_tool_tokens,
 )
 
 INTERPRETER_VERSION = "1.0.0"
@@ -34,14 +36,6 @@ class _RawMatch:
     column: int
     matched_value: str
     steps: int
-
-
-@dataclass(frozen=True, slots=True)
-class _Token:
-    value: str
-    kind: str
-    line: int
-    column: int
 
 
 class _LimitExceeded(Exception):
@@ -429,61 +423,11 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
         if literal not in value.text:
             yield _RawMatch(rule_index, rule, 1, 1, f"absent:{literal}", budget.steps)
 
-    def _tokenize(self, text: str, budget: _ExecutionBudget) -> tuple[_Token, ...]:
-        tokens: list[_Token] = []
-        offset = 0
-        line = 1
-        column = 1
-        while offset < len(text):
-            budget.step()
-            char = text[offset]
-            if char == "\n":
-                offset += 1
-                line += 1
-                column = 1
-                continue
-            if char.isspace():
-                offset += 1
-                column += 1
-                continue
-            start_line, start_column = line, column
-            if char.isalpha() or char == "_":
-                start = offset
-                while offset < len(text) and (
-                    text[offset].isalnum() or text[offset] == "_"
-                ):
-                    offset += 1
-                    column += 1
-                tokens.append(
-                    _Token(text[start:offset], "identifier", start_line, start_column)
-                )
-                continue
-            if char in ("'", '"'):
-                quote = char
-                offset += 1
-                column += 1
-                literal: list[str] = []
-                while offset < len(text) and text[offset] != quote:
-                    budget.step()
-                    if text[offset] == "\\" and offset + 1 < len(text):
-                        literal.append(text[offset + 1])
-                        offset += 2
-                        column += 2
-                    else:
-                        literal.append(text[offset])
-                        offset += 1
-                        column += 1
-                if offset < len(text):
-                    offset += 1
-                    column += 1
-                tokens.append(
-                    _Token("".join(literal), "string", start_line, start_column)
-                )
-                continue
-            tokens.append(_Token(char, "punctuation", start_line, start_column))
-            offset += 1
-            column += 1
-        return tuple(tokens)
+    @staticmethod
+    def _tokenize(text: str, budget: _ExecutionBudget) -> tuple[ToolToken, ...]:
+        if text:
+            budget.step(len(text))
+        return deterministic_tool_tokens(text)
 
     def _op_token_sequence(
         self,

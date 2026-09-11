@@ -318,6 +318,22 @@ def _parse_tool(value: Any) -> ToolDeclaration:
     )
 
 
+def _decode_manifest(manifest: bytes) -> dict[str, Any] | None:
+    try:
+        return tomllib.loads(manifest.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+
+
+def _normalize_tools(raw_tools: list[Any]) -> tuple[ToolDeclaration, ...] | None:
+    try:
+        return tuple(_parse_tool(tool) for tool in raw_tools)
+    except ToolRegistryError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 class ToolRegistry:
     """Registers validated declarative data and freezes exact tool identities."""
 
@@ -342,10 +358,9 @@ class ToolRegistry:
             raise ToolRegistryFrozen("tool_registry_frozen")
         if not isinstance(manifest, bytes):
             raise TypeError("manifest must be locked bytes")
-        try:
-            document = tomllib.loads(manifest.decode("utf-8"))
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-            raise ToolManifestError("tool_manifest_invalid_toml") from error
+        document = _decode_manifest(manifest)
+        if document is None:
+            raise ToolManifestError("tool_manifest_invalid_toml")
         _require_exact_fields(document, _TOP_LEVEL_FIELDS, location="manifest")
         if document["manifest_version"] != 1:
             raise ToolManifestError("tool_manifest_incompatible_version")
@@ -353,12 +368,9 @@ class ToolRegistry:
         if not isinstance(raw_tools, list) or not raw_tools:
             raise ToolManifestError("tool_manifest_invalid_tools")
 
-        try:
-            parsed = tuple(_parse_tool(tool) for tool in raw_tools)
-        except ToolRegistryError:
-            raise
-        except (KeyError, TypeError, ValueError, OverflowError) as error:
-            raise ToolManifestError("tool_manifest_invalid_field") from error
+        parsed = _normalize_tools(raw_tools)
+        if parsed is None:
+            raise ToolManifestError("tool_manifest_invalid_field")
         keys = tuple((tool.tool_id, tool.version) for tool in parsed)
         if len(set(keys)) != len(keys) or any(key in self._tools for key in keys):
             raise ToolRegistryConflict("tool_registry_identity_conflict")
@@ -379,12 +391,11 @@ class ToolRegistry:
 
     def resolve_exact(self, tool_id: str, version: str) -> ToolDeclaration:
         key = (tool_id, version)
-        try:
-            declaration = self._tools[key]
-        except KeyError as error:
+        declaration = self._tools.get(key)
+        if declaration is None:
             raise ToolManifestError(
                 "tool_not_registered", details={"tool_id": tool_id, "version": version}
-            ) from error
+            )
         if key in self._disabled:
             raise ToolVersionDisabled(
                 "tool_version_disabled",
