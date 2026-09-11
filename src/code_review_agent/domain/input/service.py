@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import shlex
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -28,6 +27,13 @@ from code_review_agent.domain.input.models import (
     LineType,
     NormalizedInput,
     ScopeCoverage,
+    derive_change_set_digest,
+    derive_change_set_id,
+    derive_file_id,
+    derive_hunk_content_digest_from_values,
+    derive_hunk_id,
+    derive_line_id,
+    infer_language,
 )
 from code_review_agent.domain.security.models import ArtifactPurpose
 from code_review_agent.domain.task.models import InputBinding
@@ -36,7 +42,23 @@ from code_review_agent.ports.input import InputProviderPort, SecurityBoundaryPor
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _GIT_FILE_MODE = re.compile(r"^(?:100644|100755|120000|160000)$")
+_SIMILARITY = re.compile(r"^(similarity|dissimilarity) index (?:0|[1-9][0-9]?|100)%$")
+_INDEX = re.compile(
+    r"^index ([0-9a-f]{4,64})\.\.([0-9a-f]{4,64})"
+    r"(?: (100644|100755|120000|160000))?$"
+)
 _NO_NEWLINE_MARKER = "\\ No newline at end of file"
+_C_ESCAPES = {
+    "a": b"\a",
+    "b": b"\b",
+    "t": b"\t",
+    "n": b"\n",
+    "v": b"\v",
+    "f": b"\f",
+    "r": b"\r",
+    "\\": b"\\",
+    '"': b'"',
+}
 
 
 class InputService:
@@ -111,13 +133,7 @@ class InputService:
         acquired: AcquiredPlainDiff,
         sanitized: str,
     ) -> NormalizedInput:
-        change_set_id = "changeset_" + sha256_digest(
-            {
-                "identity": acquired.identity.identity_digest,
-                "normalization_version": NORMALIZATION_VERSION,
-                "schema_major": 1,
-            }
-        )
+        change_set_id = derive_change_set_id(acquired.identity)
         files = _UnifiedDiffParser(
             content=sanitized,
             acquired=acquired,
@@ -135,30 +151,17 @@ class InputService:
             reviewable_file_ids=reviewable,
             unreviewable_file_ids=unreviewable,
         )
-        change_set_digest = sha256_digest(
-            {
-                "change_set_id": change_set_id,
-                "schema_version": SCHEMA_VERSION,
-                "identity": acquired.identity.identity_digest,
-                "files": [_file_digest_payload(item) for item in files],
-                "statistics": [
-                    acquired.byte_count,
-                    len(files),
-                    changed_line_count,
-                ],
-                "limits": [
-                    self._limits.max_bytes,
-                    self._limits.max_files,
-                    self._limits.max_changed_lines,
-                ],
-                "coverage": {
-                    "status": coverage.status.value,
-                    "reviewable": list(coverage.reviewable_file_ids),
-                    "unreviewable": list(coverage.unreviewable_file_ids),
-                },
-                "security_policy_digest": acquired.artifact_ref.policy_digest,
-                "normalization_version": NORMALIZATION_VERSION,
-            }
+        change_set_digest = derive_change_set_digest(
+            change_set_id=change_set_id,
+            schema_version=SCHEMA_VERSION,
+            identity=acquired.identity,
+            files=files,
+            byte_count=acquired.byte_count,
+            changed_line_count=changed_line_count,
+            limits=self._limits,
+            coverage=coverage,
+            sanitized_diff_ref=acquired.artifact_ref,
+            normalization_version=NORMALIZATION_VERSION,
         )
         completeness = CompletenessProof(
             status=CompletenessStatus.COMPLETE,
@@ -274,14 +277,24 @@ class _UnifiedDiffParser:
             if section_identity in seen_sections:
                 raise _MalformedDiff
             seen_sections.add(section_identity)
-            changed_file = self._parse_file(section)
+            changed_file = self._parse_file(
+                section,
+                remaining_changed_lines=(
+                    self._limits.max_changed_lines - changed_line_count
+                ),
+            )
             changed_line_count += changed_file.additions + changed_file.deletions
             if changed_line_count > self._limits.max_changed_lines:
                 raise _TooLarge("changed_lines", self._limits.max_changed_lines)
             files.append(changed_file)
         return tuple(files)
 
-    def _parse_file(self, lines: tuple[_PhysicalLine, ...]) -> ChangedFile:
+    def _parse_file(
+        self,
+        lines: tuple[_PhysicalLine, ...],
+        *,
+        remaining_changed_lines: int,
+    ) -> ChangedFile:
         header_old, header_new = _parse_diff_header(lines[0].body)
         marker_old: str | None = header_old
         marker_new: str | None = header_new
@@ -294,14 +307,26 @@ class _UnifiedDiffParser:
         recognized_fact = False
         rename_old: str | None = None
         rename_new: str | None = None
+        similarity_kind: str | None = None
+        old_mode: str | None = None
+        new_mode: str | None = None
+        index_metadata: tuple[str, str, str | None] | None = None
         hunk_drafts: list[tuple[int, int, int, int, tuple[_LineDraft, ...], str]] = []
+        parsed_changed_lines = 0
 
         index = 1
         while index < len(lines):
             body = lines[index].body
             if body.startswith("@@"):
-                draft, index = self._parse_hunk(lines, index)
+                draft, index, hunk_changed_lines = self._parse_hunk(
+                    lines,
+                    index,
+                    remaining_changed_lines=(
+                        remaining_changed_lines - parsed_changed_lines
+                    ),
+                )
                 hunk_drafts.append(draft)
+                parsed_changed_lines += hunk_changed_lines
                 recognized_fact = True
                 continue
             if body.startswith("--- "):
@@ -318,16 +343,30 @@ class _UnifiedDiffParser:
                 index += 2
                 continue
             if body.startswith("rename from "):
-                rename_old = _normalize_path(body.removeprefix("rename from "), None)
+                if rename_old is not None:
+                    raise _MalformedDiff
+                rename_old = _normalize_path(
+                    _decode_git_path_field(body.removeprefix("rename from ")),
+                    None,
+                )
                 renamed = True
                 recognized_fact = True
             elif body.startswith("rename to "):
-                rename_new = _normalize_path(body.removeprefix("rename to "), None)
+                if rename_new is not None:
+                    raise _MalformedDiff
+                rename_new = _normalize_path(
+                    _decode_git_path_field(body.removeprefix("rename to ")),
+                    None,
+                )
                 renamed = True
                 recognized_fact = True
             elif body.startswith("similarity index ") or body.startswith(
                 "dissimilarity index "
             ):
+                match = _SIMILARITY.fullmatch(body)
+                if match is None or similarity_kind is not None:
+                    raise _MalformedDiff
+                similarity_kind = match.group(1)
                 recognized_fact = True
             elif body.startswith("new file mode "):
                 if new_file or not _GIT_FILE_MODE.fullmatch(
@@ -343,7 +382,23 @@ class _UnifiedDiffParser:
                     raise _MalformedDiff
                 deleted_file = True
                 recognized_fact = True
-            elif body.startswith(("old mode ", "new mode ", "index ")):
+            elif body.startswith("old mode "):
+                mode = body.removeprefix("old mode ")
+                if old_mode is not None or not _GIT_FILE_MODE.fullmatch(mode):
+                    raise _MalformedDiff
+                old_mode = mode
+                recognized_fact = True
+            elif body.startswith("new mode "):
+                mode = body.removeprefix("new mode ")
+                if new_mode is not None or not _GIT_FILE_MODE.fullmatch(mode):
+                    raise _MalformedDiff
+                new_mode = mode
+                recognized_fact = True
+            elif body.startswith("index "):
+                match = _INDEX.fullmatch(body)
+                if match is None or index_metadata is not None:
+                    raise _MalformedDiff
+                index_metadata = (match.group(1), match.group(2), match.group(3))
                 recognized_fact = True
             elif body.startswith("Binary files ") and body.endswith(" differ"):
                 if binary_paths is not None:
@@ -365,6 +420,29 @@ class _UnifiedDiffParser:
         if new_file and deleted_file:
             raise _MalformedDiff
         if (new_file or deleted_file) and renamed:
+            raise _MalformedDiff
+        if (old_mode is None) != (new_mode is None):
+            raise _MalformedDiff
+        if old_mode is not None and (old_mode == new_mode or new_file or deleted_file):
+            raise _MalformedDiff
+        if (
+            index_metadata is not None
+            and index_metadata[2] is not None
+            and (old_mode is not None or new_file or deleted_file)
+        ):
+            raise _MalformedDiff
+        if index_metadata is not None:
+            old_is_zero = set(index_metadata[0]) == {"0"}
+            new_is_zero = set(index_metadata[1]) == {"0"}
+            if old_is_zero != new_file or new_is_zero != deleted_file:
+                raise _MalformedDiff
+        if similarity_kind == "similarity" and (
+            rename_old is None or rename_new is None
+        ):
+            raise _MalformedDiff
+        if similarity_kind == "dissimilarity" and (
+            rename_old is not None or rename_new is not None
+        ):
             raise _MalformedDiff
         if binary_paths is not None:
             binary_old, binary_new = binary_paths
@@ -421,13 +499,11 @@ class _UnifiedDiffParser:
             change_type = ChangeType.RENAMED
         else:
             change_type = ChangeType.MODIFIED
-        file_id = "file_" + sha256_digest(
-            {
-                "change_set_id": self._change_set_id,
-                "change_type": change_type.value,
-                "old_path": marker_old,
-                "new_path": marker_new,
-            }
+        file_id = derive_file_id(
+            change_set_id=self._change_set_id,
+            change_type=change_type,
+            old_path=marker_old,
+            new_path=marker_new,
         )
         hunks = tuple(
             self._materialize_hunk(file_id=file_id, draft=draft)
@@ -447,10 +523,11 @@ class _UnifiedDiffParser:
         )
         return ChangedFile(
             file_id=file_id,
+            change_set_id=self._change_set_id,
             old_path=marker_old,
             new_path=marker_new,
             change_type=change_type,
-            language=None if binary else _language(marker_new or marker_old),
+            language=infer_language(marker_new or marker_old, binary),
             is_binary=binary,
             hunks=hunks,
             additions=additions,
@@ -459,8 +536,12 @@ class _UnifiedDiffParser:
         )
 
     def _parse_hunk(
-        self, lines: tuple[_PhysicalLine, ...], index: int
-    ) -> tuple[tuple[int, int, int, int, tuple[_LineDraft, ...], str], int]:
+        self,
+        lines: tuple[_PhysicalLine, ...],
+        index: int,
+        *,
+        remaining_changed_lines: int,
+    ) -> tuple[tuple[int, int, int, int, tuple[_LineDraft, ...], str], int, int]:
         match = _HUNK_HEADER.fullmatch(lines[index].body)
         if match is None:
             raise _MalformedDiff
@@ -475,6 +556,7 @@ class _UnifiedDiffParser:
         old_line = old_start
         new_line = new_start
         sequence = 0
+        changed_lines = 0
         drafts: list[_LineDraft] = []
         index += 1
 
@@ -503,6 +585,9 @@ class _UnifiedDiffParser:
                 old_line += 1
                 new_line += 1
             elif prefix == "-":
+                if changed_lines >= remaining_changed_lines:
+                    raise _TooLarge("changed_lines", self._limits.max_changed_lines)
+                changed_lines += 1
                 if old_seen >= old_count:
                     raise _MalformedDiff
                 line_type = LineType.DELETION
@@ -511,6 +596,9 @@ class _UnifiedDiffParser:
                 old_seen += 1
                 old_line += 1
             else:
+                if changed_lines >= remaining_changed_lines:
+                    raise _TooLarge("changed_lines", self._limits.max_changed_lines)
+                changed_lines += 1
                 if new_seen >= new_count:
                     raise _MalformedDiff
                 line_type = LineType.ADDITION
@@ -532,29 +620,36 @@ class _UnifiedDiffParser:
             index += 1
         if index < len(lines) and lines[index].body == _NO_NEWLINE_MARKER:
             index += 1
-        digest = sha256_digest(
-            {
-                "ranges": [old_start, old_count, new_start, new_count],
-                "lines": [
-                    [
-                        draft.line_type.value,
-                        draft.old_line_number,
-                        draft.new_line_number,
-                        draft.sequence,
-                        draft.content_digest,
-                    ]
-                    for draft in drafts
-                ],
-            }
+        digest = derive_hunk_content_digest_from_values(
+            old_start=old_start,
+            old_count=old_count,
+            new_start=new_start,
+            new_count=new_count,
+            line_values=[
+                (
+                    draft.line_type,
+                    draft.old_line_number,
+                    draft.new_line_number,
+                    draft.sequence,
+                    draft.content_start,
+                    draft.content_end,
+                    draft.content_digest,
+                )
+                for draft in drafts
+            ],
         )
         return (
-            old_start,
-            old_count,
-            new_start,
-            new_count,
-            tuple(drafts),
-            digest,
-        ), index
+            (
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                tuple(drafts),
+                digest,
+            ),
+            index,
+            changed_lines,
+        )
 
     def _materialize_hunk(
         self,
@@ -563,42 +658,45 @@ class _UnifiedDiffParser:
         draft: tuple[int, int, int, int, tuple[_LineDraft, ...], str],
     ) -> Hunk:
         old_start, old_count, new_start, new_count, line_drafts, digest = draft
-        hunk_id = "hunk_" + sha256_digest(
-            {
-                "file_id": file_id,
-                "ranges": [old_start, old_count, new_start, new_count],
-                "content_digest": digest,
-            }
+        hunk_id = derive_hunk_id(
+            file_id=file_id,
+            old_start=old_start,
+            old_count=old_count,
+            new_start=new_start,
+            new_count=new_count,
+            content_digest=digest,
         )
-        lines = tuple(
-            Line(
-                line_id="line_"
-                + sha256_digest(
-                    {
-                        "hunk_id": hunk_id,
-                        "line_type": item.line_type.value,
-                        "old_line_number": item.old_line_number,
-                        "new_line_number": item.new_line_number,
-                        "sequence": item.sequence,
-                        "content_digest": item.content_digest,
-                    }
-                ),
-                line_type=item.line_type,
-                old_line_number=item.old_line_number,
-                new_line_number=item.new_line_number,
-                sequence=item.sequence,
-                content_ref=ArtifactSliceRef(
-                    artifact=self._acquired.artifact_ref,
-                    start=item.content_start,
-                    end=item.content_end,
-                    content_digest=item.content_digest,
-                ),
-                security_decision=self._acquired.artifact_ref.decision,
+        materialized_lines: list[Line] = []
+        for item in line_drafts:
+            content_ref = ArtifactSliceRef(
+                artifact=self._acquired.artifact_ref,
+                start=item.content_start,
+                end=item.content_end,
+                content_digest=item.content_digest,
             )
-            for item in line_drafts
-        )
+            materialized_lines.append(
+                Line(
+                    line_id=derive_line_id(
+                        hunk_id=hunk_id,
+                        line_type=item.line_type,
+                        old_line_number=item.old_line_number,
+                        new_line_number=item.new_line_number,
+                        sequence=item.sequence,
+                        content_ref=content_ref,
+                    ),
+                    hunk_id=hunk_id,
+                    line_type=item.line_type,
+                    old_line_number=item.old_line_number,
+                    new_line_number=item.new_line_number,
+                    sequence=item.sequence,
+                    content_ref=content_ref,
+                    security_decision=self._acquired.artifact_ref.decision,
+                )
+            )
+        lines = tuple(materialized_lines)
         return Hunk(
             hunk_id=hunk_id,
+            file_id=file_id,
             old_start=old_start,
             old_count=old_count,
             new_start=new_start,
@@ -633,46 +731,123 @@ def _physical_lines(content: str) -> tuple[_PhysicalLine, ...]:
 
 
 def _parse_diff_header(header: str) -> tuple[str, str]:
-    if "\\" in header:
+    prefix = "diff --git "
+    if not header.startswith(prefix):
         raise _MalformedDiff
-    try:
-        parts = shlex.split(header)
-    except ValueError as exc:
-        raise _MalformedDiff from exc
-    if len(parts) != 4 or parts[:2] != ["diff", "--git"]:
+    payload = header[len(prefix) :]
+    candidates: list[tuple[str, str]] = []
+    for index, character in enumerate(payload):
+        if character != " ":
+            continue
+        try:
+            old_path = _normalize_path(_decode_git_path_field(payload[:index]), "a/")
+            new_path = _normalize_path(
+                _decode_git_path_field(payload[index + 1 :]), "b/"
+            )
+        except _MalformedDiff:
+            continue
+        candidates.append((old_path, new_path))
+    if len(candidates) != 1:
         raise _MalformedDiff
-    return _normalize_path(parts[2], "a/"), _normalize_path(parts[3], "b/")
+    return candidates[0]
 
 
 def _parse_marker_path(value: str, prefix: str) -> str | None:
-    token = value.split("\t", 1)[0]
-    if "\\" in token:
-        raise _MalformedDiff
-    try:
-        parts = shlex.split(token)
-    except ValueError as exc:
-        raise _MalformedDiff from exc
-    if len(parts) != 1:
-        raise _MalformedDiff
-    if parts[0] == "/dev/null":
+    if value.startswith('"'):
+        token, consumed = _consume_c_style_path(value)
+        remainder = value[consumed:]
+        if remainder and not remainder.startswith("\t"):
+            raise _MalformedDiff
+    else:
+        token = value.split("\t", 1)[0]
+    if token == "/dev/null":
         return None
-    return _normalize_path(parts[0], prefix)
+    return _normalize_path(token, prefix)
 
 
 def _parse_binary_paths(value: str) -> tuple[str | None, str | None]:
     pair = value.removeprefix("Binary files ").removesuffix(" differ")
-    if " and " not in pair:
+    candidates: list[tuple[str | None, str | None]] = []
+    cursor = 0
+    while True:
+        separator = pair.find(" and ", cursor)
+        if separator < 0:
+            break
+        try:
+            old_value = _decode_git_path_field(pair[:separator])
+            new_value = _decode_git_path_field(pair[separator + 5 :])
+            old_path = (
+                None if old_value == "/dev/null" else _normalize_path(old_value, "a/")
+            )
+            new_path = (
+                None if new_value == "/dev/null" else _normalize_path(new_value, "b/")
+            )
+        except _MalformedDiff:
+            cursor = separator + 1
+            continue
+        if old_path is not None or new_path is not None:
+            candidates.append((old_path, new_path))
+        cursor = separator + 1
+    if len(candidates) != 1:
         raise _MalformedDiff
-    old_value, new_value = pair.split(" and ", 1)
-    old_path = None if old_value == "/dev/null" else _normalize_path(old_value, "a/")
-    new_path = None if new_value == "/dev/null" else _normalize_path(new_value, "b/")
-    if old_path is None and new_path is None:
+    return candidates[0]
+
+
+def _decode_git_path_field(value: str) -> str:
+    if not value:
         raise _MalformedDiff
-    return old_path, new_path
+    if not value.startswith('"'):
+        return value
+    decoded, consumed = _consume_c_style_path(value)
+    if consumed != len(value):
+        raise _MalformedDiff
+    return decoded
+
+
+def _consume_c_style_path(value: str) -> tuple[str, int]:
+    if not value.startswith('"'):
+        raise _MalformedDiff
+    decoded = bytearray()
+    index = 1
+    while index < len(value):
+        character = value[index]
+        if character == '"':
+            try:
+                return decoded.decode("utf-8", errors="strict"), index + 1
+            except UnicodeDecodeError:
+                raise _MalformedDiff from None
+        if character != "\\":
+            decoded.extend(character.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(value):
+            raise _MalformedDiff
+        escaped = value[index]
+        if escaped in "01234567":
+            end = index + 1
+            while end < len(value) and end < index + 3 and value[end] in "01234567":
+                end += 1
+            octet = int(value[index:end], 8)
+            if octet > 255:
+                raise _MalformedDiff
+            decoded.append(octet)
+            index = end
+            continue
+        replacement = _C_ESCAPES.get(escaped)
+        if replacement is None:
+            raise _MalformedDiff
+        decoded.extend(replacement)
+        index += 1
+    raise _MalformedDiff
 
 
 def _normalize_path(value: str, prefix: str | None) -> str:
-    if not value or "\x00" in value or "\\" in value:
+    if (
+        not value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise _MalformedDiff
     if prefix is not None:
         if not value.startswith(prefix):
@@ -689,44 +864,6 @@ def _normalize_path(value: str, prefix: str | None) -> str:
     if path.is_absolute() or str(path) != value:
         raise _MalformedDiff
     return value
-
-
-def _language(path: str | None) -> str | None:
-    if path is None:
-        return None
-    suffixes = {
-        ".py": "python",
-        ".js": "javascript",
-        ".jsx": "javascript",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-    }
-    return suffixes.get(PurePosixPath(path).suffix.lower())
-
-
-def _file_digest_payload(changed_file: ChangedFile) -> dict[str, object]:
-    return {
-        "file_id": changed_file.file_id,
-        "paths": [changed_file.old_path, changed_file.new_path],
-        "change_type": changed_file.change_type.value,
-        "language": changed_file.language,
-        "binary": changed_file.is_binary,
-        "statistics": [changed_file.additions, changed_file.deletions],
-        "unreviewable_reason": changed_file.unreviewable_reason,
-        "hunks": [
-            {
-                "hunk_id": hunk.hunk_id,
-                "ranges": [
-                    hunk.old_start,
-                    hunk.old_count,
-                    hunk.new_start,
-                    hunk.new_count,
-                ],
-                "content_digest": hunk.content_digest,
-            }
-            for hunk in changed_file.hunks
-        ],
-    }
 
 
 def _error(

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 
 from code_review_agent.domain.common.digests import sha256_digest
 from code_review_agent.domain.common.time import ensure_utc
 from code_review_agent.domain.security.models import (
+    ArtifactKind,
+    ArtifactPurpose,
     SanitizedArtifactRef,
     SecurityDecision,
 )
@@ -132,6 +136,7 @@ class ArtifactSliceRef:
 @dataclass(frozen=True, slots=True)
 class Line:
     line_id: str
+    hunk_id: str
     line_type: LineType
     old_line_number: int | None
     new_line_number: int | None
@@ -154,11 +159,24 @@ class Line:
             self.old_line_number is None or self.new_line_number is None
         ):
             raise ValueError("context must have both side locations")
+        expected_id = derive_line_id(
+            hunk_id=self.hunk_id,
+            line_type=self.line_type,
+            old_line_number=self.old_line_number,
+            new_line_number=self.new_line_number,
+            sequence=self.sequence,
+            content_ref=self.content_ref,
+        )
+        if self.line_id != expected_id:
+            raise ValueError("line identity does not match canonical content")
+        if self.security_decision is not self.content_ref.artifact.decision:
+            raise ValueError("line security decision does not match its artifact")
 
 
 @dataclass(frozen=True, slots=True)
 class Hunk:
     hunk_id: str
+    file_id: str
     old_start: int
     old_count: int
     new_start: int
@@ -188,11 +206,32 @@ class Hunk:
         )
         if old_line_count != self.old_count or new_line_count != self.new_count:
             raise ValueError("hunk line counts do not match its ranges")
+        expected_digest = derive_hunk_content_digest(
+            old_start=self.old_start,
+            old_count=self.old_count,
+            new_start=self.new_start,
+            new_count=self.new_count,
+            lines=self.lines,
+        )
+        expected_id = derive_hunk_id(
+            file_id=self.file_id,
+            old_start=self.old_start,
+            old_count=self.old_count,
+            new_start=self.new_start,
+            new_count=self.new_count,
+            content_digest=expected_digest,
+        )
+        if self.content_digest != expected_digest or self.hunk_id != expected_id:
+            raise ValueError("hunk identity does not match canonical content")
+        if any(line.hunk_id != self.hunk_id for line in self.lines):
+            raise ValueError("hunk lines must bind to their parent hunk")
+        _validate_line_locations(self)
 
 
 @dataclass(frozen=True, slots=True)
 class ChangedFile:
     file_id: str
+    change_set_id: str
     old_path: str | None
     new_path: str | None
     change_type: ChangeType
@@ -226,6 +265,20 @@ class ChangedFile:
         )
         if self.additions != additions or self.deletions != deletions:
             raise ValueError("file statistics do not match hunk lines")
+        expected_id = derive_file_id(
+            change_set_id=self.change_set_id,
+            change_type=self.change_type,
+            old_path=self.old_path,
+            new_path=self.new_path,
+        )
+        if self.file_id != expected_id:
+            raise ValueError("file identity does not match canonical paths")
+        if self.language != infer_language(
+            self.new_path or self.old_path, self.is_binary
+        ):
+            raise ValueError("file language does not match its canonical path")
+        if any(hunk.file_id != self.file_id for hunk in self.hunks):
+            raise ValueError("file hunks must bind to their parent file")
         _validate_hunk_order(self.hunks)
 
 
@@ -374,6 +427,9 @@ class ChangeSet:
             raise ValueError("change set line count mismatch")
         if self.byte_count < 0:
             raise ValueError("change set byte count must be non-negative")
+        expected_id = derive_change_set_id(self.identity)
+        if self.change_set_id != expected_id:
+            raise ValueError("change set identity does not match input identity")
         if self.completeness.change_set_digest != self.change_set_digest:
             raise ValueError("completeness proof does not bind the change set")
         proof = self.completeness
@@ -397,6 +453,11 @@ class ChangeSet:
         file_ids = tuple(changed_file.file_id for changed_file in self.files)
         if len(set(file_ids)) != len(file_ids):
             raise ValueError("change set file identities must be unique")
+        if any(
+            changed_file.change_set_id != self.change_set_id
+            for changed_file in self.files
+        ):
+            raise ValueError("changed files must bind to their change set")
         covered_ids = (
             self.coverage.reviewable_file_ids
             + self.coverage.unreviewable_file_ids
@@ -420,6 +481,36 @@ class ChangeSet:
         )
         if set(self.coverage.reviewable_file_ids) != expected_reviewable:
             raise ValueError("coverage does not match reviewable files")
+        reference = self.sanitized_diff_ref
+        if (
+            reference.kind is not ArtifactKind.DIFF
+            or reference.purpose is not ArtifactPurpose.DOMAIN_INGRESS
+            or reference.artifact_id != f"plain-diff-{self.identity.identity_digest}"
+        ):
+            raise ValueError("change set security artifact identity mismatch")
+        if any(
+            line.content_ref.artifact != reference
+            for changed_file in self.files
+            for hunk in changed_file.hunks
+            for line in hunk.lines
+        ):
+            raise ValueError(
+                "line content references must bind to the change set artifact"
+            )
+        expected_digest = derive_change_set_digest(
+            change_set_id=self.change_set_id,
+            schema_version=self.schema_version,
+            identity=self.identity,
+            files=self.files,
+            byte_count=self.byte_count,
+            changed_line_count=self.changed_line_count,
+            limits=self.limits,
+            coverage=self.coverage,
+            sanitized_diff_ref=self.sanitized_diff_ref,
+            normalization_version=self.normalization_version,
+        )
+        if self.change_set_digest != expected_digest:
+            raise ValueError("change set digest does not match canonical content")
         object.__setattr__(self, "created_at", ensure_utc(self.created_at))
 
 
@@ -449,6 +540,252 @@ class NormalizedInput:
             raise ValueError("plain diff binding cannot contain commit SHAs")
         if self.change_set.sanitized_diff_ref.task_id != self.binding.task_id:
             raise ValueError("input binding task mismatch")
+
+
+def derive_line_id(
+    *,
+    hunk_id: str,
+    line_type: LineType,
+    old_line_number: int | None,
+    new_line_number: int | None,
+    sequence: int,
+    content_ref: ArtifactSliceRef,
+) -> str:
+    return "line_" + sha256_digest(
+        {
+            "hunk_id": hunk_id,
+            "line_type": line_type.value,
+            "old_line_number": old_line_number,
+            "new_line_number": new_line_number,
+            "sequence": sequence,
+            "content_ref": {
+                "artifact_id": content_ref.artifact.artifact_id,
+                "kind": content_ref.artifact.kind.value,
+                "purpose": content_ref.artifact.purpose.value,
+                "sanitized_digest": content_ref.artifact.sanitized_digest,
+                "policy_digest": content_ref.artifact.policy_digest,
+                "start": content_ref.start,
+                "end": content_ref.end,
+                "content_digest": content_ref.content_digest,
+            },
+        }
+    )
+
+
+def derive_hunk_content_digest(
+    *,
+    old_start: int,
+    old_count: int,
+    new_start: int,
+    new_count: int,
+    lines: Sequence[Line],
+) -> str:
+    return derive_hunk_content_digest_from_values(
+        old_start=old_start,
+        old_count=old_count,
+        new_start=new_start,
+        new_count=new_count,
+        line_values=[
+            (
+                line.line_type,
+                line.old_line_number,
+                line.new_line_number,
+                line.sequence,
+                line.content_ref.start,
+                line.content_ref.end,
+                line.content_ref.content_digest,
+            )
+            for line in lines
+        ],
+    )
+
+
+def derive_hunk_content_digest_from_values(
+    *,
+    old_start: int,
+    old_count: int,
+    new_start: int,
+    new_count: int,
+    line_values: Sequence[tuple[LineType, int | None, int | None, int, int, int, str]],
+) -> str:
+    return sha256_digest(
+        {
+            "ranges": [old_start, old_count, new_start, new_count],
+            "lines": [
+                [
+                    line_type.value,
+                    old_line_number,
+                    new_line_number,
+                    sequence,
+                    start,
+                    end,
+                    content_digest,
+                ]
+                for (
+                    line_type,
+                    old_line_number,
+                    new_line_number,
+                    sequence,
+                    start,
+                    end,
+                    content_digest,
+                ) in line_values
+            ],
+        }
+    )
+
+
+def derive_hunk_id(
+    *,
+    file_id: str,
+    old_start: int,
+    old_count: int,
+    new_start: int,
+    new_count: int,
+    content_digest: str,
+) -> str:
+    return "hunk_" + sha256_digest(
+        {
+            "file_id": file_id,
+            "ranges": [old_start, old_count, new_start, new_count],
+            "content_digest": content_digest,
+        }
+    )
+
+
+def derive_file_id(
+    *,
+    change_set_id: str,
+    change_type: ChangeType,
+    old_path: str | None,
+    new_path: str | None,
+) -> str:
+    return "file_" + sha256_digest(
+        {
+            "change_set_id": change_set_id,
+            "change_type": change_type.value,
+            "old_path": old_path,
+            "new_path": new_path,
+        }
+    )
+
+
+def derive_change_set_id(identity: InputIdentity) -> str:
+    return "changeset_" + sha256_digest(
+        {
+            "identity": identity.identity_digest,
+            "normalization_version": identity.normalization_version,
+            "schema_major": 1,
+        }
+    )
+
+
+def derive_change_set_digest(
+    *,
+    change_set_id: str,
+    schema_version: str,
+    identity: InputIdentity,
+    files: Sequence[ChangedFile],
+    byte_count: int,
+    changed_line_count: int,
+    limits: InputLimits,
+    coverage: ScopeCoverage,
+    sanitized_diff_ref: SanitizedArtifactRef,
+    normalization_version: str,
+) -> str:
+    return sha256_digest(
+        {
+            "change_set_id": change_set_id,
+            "schema_version": schema_version,
+            "identity": identity.identity_digest,
+            "files": [_file_digest_payload(item) for item in files],
+            "statistics": [byte_count, len(files), changed_line_count],
+            "limits": [
+                limits.max_bytes,
+                limits.max_files,
+                limits.max_changed_lines,
+            ],
+            "coverage": {
+                "status": coverage.status.value,
+                "reviewable": list(coverage.reviewable_file_ids),
+                "unreviewable": list(coverage.unreviewable_file_ids),
+                "safely_skipped": list(coverage.safely_skipped_file_ids),
+            },
+            "security": {
+                "artifact_id": sanitized_diff_ref.artifact_id,
+                "kind": sanitized_diff_ref.kind.value,
+                "purpose": sanitized_diff_ref.purpose.value,
+                "decision": sanitized_diff_ref.decision.value,
+                "sanitized_digest": sanitized_diff_ref.sanitized_digest,
+                "policy_id": sanitized_diff_ref.policy_id,
+                "policy_version": sanitized_diff_ref.policy_version,
+                "policy_digest": sanitized_diff_ref.policy_digest,
+            },
+            "normalization_version": normalization_version,
+        }
+    )
+
+
+def infer_language(path: str | None, is_binary: bool) -> str | None:
+    if path is None or is_binary:
+        return None
+    suffixes = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+    }
+    return suffixes.get(PurePosixPath(path).suffix.lower())
+
+
+def _file_digest_payload(changed_file: ChangedFile) -> dict[str, object]:
+    return {
+        "file_id": changed_file.file_id,
+        "change_set_id": changed_file.change_set_id,
+        "paths": [changed_file.old_path, changed_file.new_path],
+        "change_type": changed_file.change_type.value,
+        "language": changed_file.language,
+        "binary": changed_file.is_binary,
+        "statistics": [changed_file.additions, changed_file.deletions],
+        "unreviewable_reason": changed_file.unreviewable_reason,
+        "hunks": [
+            {
+                "hunk_id": hunk.hunk_id,
+                "file_id": hunk.file_id,
+                "ranges": [
+                    hunk.old_start,
+                    hunk.old_count,
+                    hunk.new_start,
+                    hunk.new_count,
+                ],
+                "content_digest": hunk.content_digest,
+                "line_ids": [line.line_id for line in hunk.lines],
+            }
+            for hunk in changed_file.hunks
+        ],
+    }
+
+
+def _validate_line_locations(hunk: Hunk) -> None:
+    old_line = hunk.old_start
+    new_line = hunk.new_start
+    for sequence, line in enumerate(hunk.lines, start=1):
+        if line.sequence != sequence:
+            raise ValueError("hunk line sequence must be contiguous")
+        if line.line_type is LineType.CONTEXT:
+            if line.old_line_number != old_line or line.new_line_number != new_line:
+                raise ValueError("context line location does not match hunk range")
+            old_line += 1
+            new_line += 1
+        elif line.line_type is LineType.DELETION:
+            if line.old_line_number != old_line:
+                raise ValueError("deletion line location does not match hunk range")
+            old_line += 1
+        else:
+            if line.new_line_number != new_line:
+                raise ValueError("addition line location does not match hunk range")
+            new_line += 1
 
 
 def _validate_hunk_order(hunks: tuple[Hunk, ...]) -> None:

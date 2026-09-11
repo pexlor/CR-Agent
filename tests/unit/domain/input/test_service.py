@@ -330,6 +330,36 @@ def test_file_lifecycle_mode_conflicts_with_old_new_mode_pair() -> None:
     assert captured.value.code == "input_malformed"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            "diff --git a/app.py b/app.py\n"
+            "new file mode 100644\n"
+            "index 1234567..abcdef0\n"
+            "--- /dev/null\n"
+            "+++ b/app.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+new\n"
+        ),
+        (
+            "diff --git a/app.py b/app.py\n"
+            "deleted file mode 100644\n"
+            "index 1234567..abcdef0\n"
+            "--- a/app.py\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-old\n"
+        ),
+    ],
+)
+def test_index_zero_side_must_match_file_lifecycle(content: str) -> None:
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+
+
 def test_duplicate_rename_metadata_is_rejected() -> None:
     content = (
         "diff --git a/old.py b/new.py\n"
