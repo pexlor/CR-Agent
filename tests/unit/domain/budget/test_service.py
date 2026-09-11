@@ -11,7 +11,9 @@ from code_review_agent.domain.budget.models import (
 from code_review_agent.domain.budget.service import BudgetService
 
 
-def capability(*, valid: bool = True, digest: str = "request-digest") -> ProviderHardBudgetCapability:
+def capability(
+    *, valid: bool = True, digest: str = "request-digest"
+) -> ProviderHardBudgetCapability:
     return ProviderHardBudgetCapability(
         capability_id="capability-1",
         provider_id="provider",
@@ -27,7 +29,7 @@ def capability(*, valid: bool = True, digest: str = "request-digest") -> Provide
     )
 
 
-def test_reservation_uses_input_plus_output_and_insufficient_budget_does_not_freeze() -> None:
+def test_reservation_budget_limits_do_not_freeze_account() -> None:
     service = BudgetService()
     account = service.create_account("task-1", 100, capability_ref="capability-1")
 
@@ -54,7 +56,9 @@ def test_reservation_uses_input_plus_output_and_insufficient_budget_does_not_fre
     )
     assert isinstance(denied, ReservationDenied)
     assert denied.code == "insufficient_budget"
-    assert service.get_summary(account.account_id).account_state is BudgetAccountState.OPEN
+    assert (
+        service.get_summary(account.account_id).account_state is BudgetAccountState.OPEN
+    )
 
 
 def test_model_call_has_one_reservation_and_retry_uses_new_call() -> None:
@@ -176,4 +180,6 @@ def test_add_authorization_preserves_history_and_does_not_auto_unfreeze() -> Non
         capability=capability(),
         explicit_resume=True,
     )
-    assert service.get_summary(account.account_id).account_state is BudgetAccountState.OPEN
+    assert (
+        service.get_summary(account.account_id).account_state is BudgetAccountState.OPEN
+    )

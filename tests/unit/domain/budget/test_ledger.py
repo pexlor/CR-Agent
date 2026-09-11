@@ -1,4 +1,5 @@
-from hypothesis import given, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 
 from code_review_agent.domain.budget.ledger import BudgetLedger
 from code_review_agent.domain.budget.models import BudgetAccountState, LedgerEntryType
@@ -18,8 +19,12 @@ def test_projection_formula_never_returns_negative_public_balances(
 ) -> None:
     entries = (
         BudgetLedger.entry(LedgerEntryType.AUTHORIZATION_INITIAL, authorization, 1),
-        BudgetLedger.entry(LedgerEntryType.USAGE_SETTLED, known, 2, reservation_amount=0),
-        BudgetLedger.entry(LedgerEntryType.UNKNOWN_COMMITTED, uncertain, 3, reservation_amount=0),
+        BudgetLedger.entry(
+            LedgerEntryType.USAGE_SETTLED, known, 2, reservation_amount=0
+        ),
+        BudgetLedger.entry(
+            LedgerEntryType.UNKNOWN_COMMITTED, uncertain, 3, reservation_amount=0
+        ),
         BudgetLedger.entry(LedgerEntryType.RESERVATION_CREATED, active, 4),
     )
 
@@ -35,7 +40,9 @@ def test_overage_is_disclosed_without_double_counting_consumption() -> None:
     entries = (
         BudgetLedger.entry(LedgerEntryType.AUTHORIZATION_INITIAL, 100, 1),
         BudgetLedger.entry(LedgerEntryType.RESERVATION_CREATED, 80, 2),
-        BudgetLedger.entry(LedgerEntryType.USAGE_SETTLED, 120, 3, reservation_amount=80),
+        BudgetLedger.entry(
+            LedgerEntryType.USAGE_SETTLED, 120, 3, reservation_amount=80
+        ),
         BudgetLedger.entry(LedgerEntryType.USAGE_OVERAGE_RECORDED, 40, 4),
     )
 
