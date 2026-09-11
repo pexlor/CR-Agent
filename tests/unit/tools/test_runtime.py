@@ -190,7 +190,7 @@ def test_byte_limit_rejects_before_input_digest_or_tokenization(
 
     monkeypatch.setattr(AuthorizedToolInput, "input_digest", property(forbidden_digest))
     monkeypatch.setattr(
-        runtime_module, "deterministic_tool_tokens", forbidden_tokenization
+        runtime_module, "iter_deterministic_tool_tokens", forbidden_tokenization
     )
 
     result = runtime.execute(

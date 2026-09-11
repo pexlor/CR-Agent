@@ -22,10 +22,13 @@ from code_review_agent.ports.tools import (
     ToolLimits,
     ToolToken,
     deterministic_tool_token_count,
-    deterministic_tool_tokens,
+    iter_deterministic_tool_tokens,
 )
 
 INTERPRETER_VERSION = "1.0.0"
+UNCOMPUTED_INPUT_DIGEST = sha256_digest(
+    {"input_digest": "not_computed_before_size_gate"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +97,18 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
     ) -> ToolExecutionResult:
         declaration = self._catalog.verify_fixed_reference(fixed_tool_ref)
         limits = declaration.limits.constrained_by(planned_limits)
+
+        size_error = self._validate_input_size(authorized_input, limits)
+        if size_error is not None:
+            return self._result(
+                declaration=declaration,
+                input_digest=UNCOMPUTED_INPUT_DIGEST,
+                limits=limits,
+                state=ToolExecutionState.BLOCKED,
+                steps=0,
+                evidence=(),
+                error_code=size_error,
+            )
         input_digest = authorized_input.input_digest
 
         if len(declaration.rules) > limits.max_rules:
@@ -209,6 +224,26 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
         return success
 
     @staticmethod
+    def _validate_input_size(
+        authorized_input: AuthorizedToolInput, limits: ToolLimits
+    ) -> str | None:
+        byte_count = 0
+        for char in authorized_input.text:
+            codepoint = ord(char)
+            byte_count += (
+                1
+                if codepoint <= 0x7F
+                else 2
+                if codepoint <= 0x7FF
+                else 3
+                if codepoint <= 0xFFFF
+                else 4
+            )
+            if byte_count > limits.max_input_bytes:
+                return "tool_input_bytes_exceeded"
+        return None
+
+    @staticmethod
     def _validate_input(
         authorized_input: AuthorizedToolInput, limits: ToolLimits
     ) -> str | None:
@@ -218,8 +253,6 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
             != authorized_input.text
         ):
             return "tool_input_not_normalized"
-        if len(authorized_input.text.encode("utf-8")) > limits.max_input_bytes:
-            return "tool_input_bytes_exceeded"
         actual_token_count = deterministic_tool_token_count(authorized_input.text)
         if actual_token_count > limits.max_tokens:
             return "tool_input_tokens_exceeded"
@@ -427,7 +460,7 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
     def _tokenize(text: str, budget: _ExecutionBudget) -> tuple[ToolToken, ...]:
         if text:
             budget.step(len(text))
-        return deterministic_tool_tokens(text)
+        return tuple(iter_deterministic_tool_tokens(text))
 
     def _op_token_sequence(
         self,

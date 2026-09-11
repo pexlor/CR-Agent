@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
@@ -21,12 +22,11 @@ class ToolToken:
     column: int
 
 
-def deterministic_tool_tokens(text: str) -> tuple[ToolToken, ...]:
-    """Lex text once for both resource limits and finite-language operations."""
+def iter_deterministic_tool_tokens(text: str) -> Iterator[ToolToken]:
+    """Yield the tokens used by limits and finite-language operations."""
 
     if not isinstance(text, str):
         raise TypeError("text must be a string")
-    tokens: list[ToolToken] = []
     offset = 0
     line = 1
     column = 1
@@ -49,9 +49,7 @@ def deterministic_tool_tokens(text: str) -> tuple[ToolToken, ...]:
             ):
                 offset += 1
                 column += 1
-            tokens.append(
-                ToolToken(text[start:offset], "identifier", start_line, start_column)
-            )
+            yield ToolToken(text[start:offset], "identifier", start_line, start_column)
             continue
         if char in ("'", '"'):
             delimiter = char * 3 if text.startswith(char * 3, offset) else char
@@ -74,20 +72,23 @@ def deterministic_tool_tokens(text: str) -> tuple[ToolToken, ...]:
             if offset < len(text):
                 offset += len(delimiter)
                 column += len(delimiter)
-            tokens.append(
-                ToolToken("".join(literal), "string", start_line, start_column)
-            )
+            yield ToolToken("".join(literal), "string", start_line, start_column)
             continue
-        tokens.append(ToolToken(char, "punctuation", start_line, start_column))
+        yield ToolToken(char, "punctuation", start_line, start_column)
         offset += 1
         column += 1
-    return tuple(tokens)
+
+
+def deterministic_tool_tokens(text: str) -> tuple[ToolToken, ...]:
+    """Materialize tokens only for operations that require random access."""
+
+    return tuple(iter_deterministic_tool_tokens(text))
 
 
 def deterministic_tool_token_count(text: str) -> int:
     """Count exactly the tokens consumed by the restricted runtime lexer."""
 
-    return len(deterministic_tool_tokens(text))
+    return sum(1 for _ in iter_deterministic_tool_tokens(text))
 
 
 def _is_sha256(value: str) -> bool:
