@@ -1,8 +1,12 @@
+from collections.abc import Mapping
+
 import pytest
 
+from code_review_agent.domain.common.digests import canonical_json
 from code_review_agent.domain.execution.models import (
     ModelCallState,
     ModelUsage,
+    PromptEnvelope,
     ProviderState,
     ResponseState,
     StructuredOutputStrategy,
@@ -91,3 +95,37 @@ def test_usage_requires_counts_only_when_known() -> None:
         ModelUsage(UsageState.KNOWN)
     with pytest.raises(ValueError, match="missing usage"):
         ModelUsage(UsageState.MISSING, input_tokens=1, output_tokens=2)
+
+
+def test_prompt_envelope_is_deeply_immutable_and_complete() -> None:
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"findings": {"type": "array", "items": []}},
+    }
+    context = ["src/example.py:1"]
+    prohibited = ["streaming", "dynamic_tools"]
+    value = PromptEnvelope(
+        system_rules="review",
+        work_unit="unit-1",
+        diff="diff",
+        controlled_context=context,  # type: ignore[arg-type]
+        tool_facts=("tool:fact",),
+        prohibited_capabilities=prohibited,  # type: ignore[arg-type]
+        version_digest="versions-1",
+        output_schema=schema,
+    )
+    frozen_schema = canonical_json(value.output_schema)
+
+    context.append("src/other.py:2")
+    prohibited.append("fallback")
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    properties["extra"] = {"type": "string"}
+
+    assert value.controlled_context == ("src/example.py:1",)
+    assert value.prohibited_capabilities == ("streaming", "dynamic_tools")
+    assert canonical_json(value.output_schema) == frozen_schema
+    nested = value.output_schema["properties"]
+    assert isinstance(nested, Mapping)
+    with pytest.raises(TypeError):
+        nested["extra"] = {}  # type: ignore[index]

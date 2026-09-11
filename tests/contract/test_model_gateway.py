@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from dataclasses import replace
 
 import pytest
 
@@ -20,6 +22,9 @@ from code_review_agent.domain.execution.models import (
     UsageState,
 )
 from code_review_agent.ports.model import ModelGatewayPort
+from tests.contract.model_gateway_harness import (
+    assert_provider_preparation_contract,
+)
 from tests.fakes.model_provider import FakeModelProvider
 
 
@@ -40,6 +45,9 @@ def capabilities(
         streaming_disabled=True,
         retries_disabled=True,
         dynamic_tools_disabled=True,
+        request_method="POST",
+        request_path="/model",
+        fixed_headers={"accept": "application/json", "content-type": "application/json"},
     )
 
 
@@ -48,7 +56,10 @@ def envelope() -> PromptEnvelope:
         system_rules="Review only the supplied change.",
         work_unit="unit-1",
         diff="@@ -1 +1 @@\n-old\n+new",
+        controlled_context=("src/example.py:1",),
         tool_facts=("static:clean",),
+        prohibited_capabilities=("dynamic_tools", "streaming"),
+        version_digest="versions-1",
         output_schema={
             "type": "object",
             "additionalProperties": False,
@@ -71,17 +82,60 @@ def options(
 
 
 @pytest.mark.parametrize("strategy", tuple(StructuredOutputStrategy))
-def test_fake_provider_implements_shared_contract_for_fixed_strategy(
+def test_fake_provider_implements_reusable_contract_for_fixed_strategy(
     strategy: StructuredOutputStrategy,
 ) -> None:
     provider: ModelGatewayPort = FakeModelProvider(capabilities())
 
-    prepared = ModelGateway().prepare(provider, envelope(), options(strategy))
+    first, second = assert_provider_preparation_contract(
+        provider, envelope(), options(strategy)
+    )
 
-    assert prepared.strategy is strategy
-    assert prepared.output_token_max == 200
-    assert prepared.body_digest
-    assert provider.capabilities.model_id == "fake-model"
+    assert first.strategy is strategy
+    assert second.strategy is strategy
+
+
+@pytest.mark.parametrize("strategy", tuple(StructuredOutputStrategy))
+def test_fake_provider_has_fixed_wire_semantics(
+    strategy: StructuredOutputStrategy,
+) -> None:
+    provider = FakeModelProvider(capabilities())
+
+    prepared = provider.prepare_request(envelope(), options(strategy))
+    body = json.loads(prepared.body)
+
+    assert body["controlled_context"] == ["src/example.py:1"]
+    assert body["prohibited_capabilities"] == ["dynamic_tools", "streaming"]
+    assert body["version_digest"] == "versions-1"
+    if strategy is StructuredOutputStrategy.JSON_SCHEMA:
+        assert body["structured_output"] == {
+            "mode": "json_schema",
+            "schema": dict(envelope().output_schema),
+        }
+    elif strategy is StructuredOutputStrategy.TOOL_CALLING:
+        assert body["structured_output"] == {
+            "mode": "tool_calling",
+            "tool": {
+                "input_schema": dict(envelope().output_schema),
+                "name": "submit_review",
+            },
+        }
+    else:
+        assert body["structured_output"] == {
+            "instruction": "return_json_only",
+            "mode": "json_text",
+            "schema": dict(envelope().output_schema),
+        }
+
+
+def test_fake_provider_counts_are_not_part_of_shared_contract() -> None:
+    provider = FakeModelProvider(capabilities())
+
+    provider.prepare_request(
+        envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    assert provider.prepare_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -124,21 +178,7 @@ def test_selected_strategy_does_not_fallback_when_unsupported() -> None:
 
 
 def test_incompatible_provider_safety_capability_is_rejected() -> None:
-    unsafe = capabilities()
-    unsafe = ModelCapabilities(
-        provider_id=unsafe.provider_id,
-        provider_version=unsafe.provider_version,
-        model_id=unsafe.model_id,
-        origin=unsafe.origin,
-        context_token_limit=unsafe.context_token_limit,
-        max_output_tokens=unsafe.max_output_tokens,
-        structured_output_strategies=unsafe.structured_output_strategies,
-        preflight_token_counting=unsafe.preflight_token_counting,
-        usage_mapping_trusted=unsafe.usage_mapping_trusted,
-        streaming_disabled=False,
-        retries_disabled=True,
-        dynamic_tools_disabled=True,
-    )
+    unsafe = replace(capabilities(), streaming_disabled=False)
     provider = FakeModelProvider(unsafe)
 
     with pytest.raises(StableError, match="model_capability_mismatch"):
@@ -159,11 +199,12 @@ async def test_failure_before_request_is_sent_releases_reservation() -> None:
             ),
         ),
     )
-    prepared = ModelGateway().prepare(
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
 
-    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
 
     assert outcome.state == ModelCallState(
         ProviderState.FAILED_KNOWN, ResponseState.NOT_AVAILABLE
@@ -178,11 +219,12 @@ async def test_unknown_after_send_is_conservatively_committed_without_retry() ->
         capabilities(),
         (ProviderSendResult(provider_state=ProviderState.UNKNOWN),),
     )
-    prepared = ModelGateway().prepare(
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
 
-    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
 
     assert outcome.state == ModelCallState(
         ProviderState.UNKNOWN, ResponseState.NOT_AVAILABLE
@@ -204,15 +246,124 @@ async def test_unknown_cannot_be_downgraded_by_reported_usage() -> None:
             ),
         ),
     )
-    prepared = ModelGateway().prepare(
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
 
-    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
 
     assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
     assert outcome.accounted_tokens == 500
     assert outcome.usage.state is UsageState.UNTRUSTED
+
+
+@pytest.mark.asyncio
+async def test_untrusted_provider_usage_capability_downgrades_known_usage() -> None:
+    provider = FakeModelProvider(
+        replace(capabilities(), usage_mapping_trusted=False),
+        (
+            ProviderSendResult(
+                provider_state=ProviderState.SUCCEEDED,
+                request_sent=True,
+                response_payload={"findings": []},
+                usage=ModelUsage(UsageState.KNOWN, 300, 250),
+            ),
+        ),
+    )
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
+
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.usage.state is UsageState.UNTRUSTED
+    assert outcome.accounted_tokens == 550
+    assert outcome.overage_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_request_not_issued_by_its_prepare() -> None:
+    provider = successful_provider(ModelUsage(UsageState.KNOWN, 100, 50))
+    prepared = provider.prepare_request(
+        envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    with pytest.raises(StableError) as caught:
+        await ModelGateway().send(provider, prepared, reservation_tokens=500)
+
+    assert caught.value.code == "model_capability_mismatch"
+    assert provider.send_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("method", "GET"),
+        ("path", "https://attacker.example/model"),
+        ("headers", {"content-type": "text/plain"}),
+        ("strategy", StructuredOutputStrategy.JSON_TEXT),
+        ("output_token_max", 1_001),
+        ("preparation_id", "forged"),
+    ),
+)
+async def test_gateway_revalidates_fixed_request_before_send(
+    field: str, invalid_value: object
+) -> None:
+    provider = successful_provider(ModelUsage(UsageState.KNOWN, 100, 50))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    object.__setattr__(prepared, field, invalid_value)
+
+    with pytest.raises(StableError) as caught:
+        await gateway.send(provider, prepared, reservation_tokens=500)
+
+    assert caught.value.code == "model_capability_mismatch"
+    assert provider.send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fake_provider_rejects_foreign_prepare_permit() -> None:
+    first = FakeModelProvider(capabilities())
+    second = FakeModelProvider(capabilities())
+    prepared = first.prepare_request(
+        envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    with pytest.raises(ValueError, match="prepare permit"):
+        await second.send_prepared(prepared)
+
+    assert second.send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_prepared_request_permit_cannot_be_replayed() -> None:
+    provider = FakeModelProvider(
+        capabilities(),
+        (
+            ProviderSendResult(
+                provider_state=ProviderState.SUCCEEDED,
+                request_sent=True,
+                response_payload={"findings": []},
+                usage=ModelUsage(UsageState.KNOWN, 100, 50),
+            ),
+        ),
+    )
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    await gateway.send(provider, prepared, reservation_tokens=500)
+
+    with pytest.raises(StableError, match="model_capability_mismatch"):
+        await gateway.send(provider, prepared, reservation_tokens=500)
+
+    assert provider.send_calls == 1
 
 
 @pytest.mark.asyncio
@@ -236,11 +387,12 @@ async def test_missing_or_untrusted_usage_is_accounted_conservatively(
     usage: ModelUsage, action: ReservationAction, accounted: int
 ) -> None:
     provider = successful_provider(usage)
-    prepared = ModelGateway().prepare(
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
 
-    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
 
     assert outcome.state == ModelCallState(
         ProviderState.SUCCEEDED, ResponseState.PENDING
@@ -262,11 +414,12 @@ async def test_trusted_actual_usage_can_be_below_or_above_reservation(
     usage: ModelUsage, accounted: int, overage: int
 ) -> None:
     provider = successful_provider(usage)
-    prepared = ModelGateway().prepare(
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
 
-    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
 
     assert outcome.reservation_action is ReservationAction.SETTLE_KNOWN
     assert outcome.accounted_tokens == accounted
@@ -283,11 +436,12 @@ async def test_unexpected_provider_exception_becomes_unknown_without_error_text(
             raise RuntimeError("credential=top-secret")
 
     provider = ExplodingProvider(capabilities())
-    prepared = ModelGateway().prepare(
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
 
-    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
 
     assert outcome.state.provider_state is ProviderState.UNKNOWN
     assert outcome.error_code == "model_result_unknown"
