@@ -1,0 +1,8 @@
+diff --git a/app.py b/app.py
+index 1234567..abcdef0 100644
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+ keep = 1
+-old = True
++new = True

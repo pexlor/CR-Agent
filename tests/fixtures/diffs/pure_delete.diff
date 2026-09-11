@@ -1,0 +1,8 @@
+diff --git a/removed.py b/removed.py
+deleted file mode 100644
+index 1234567..0000000
+--- a/removed.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-first = 1
+-second = 2

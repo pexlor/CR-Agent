@@ -1,0 +1,36 @@
+manifest_version = 1
+
+[[tools]]
+kind = "review_tool"
+id = "dangerous-python-execution"
+version = "1.0.0"
+contract_version = "1.0"
+display_name = "Dangerous Python Execution"
+capabilities = ["deterministic_text_analysis"]
+required_system_capabilities = []
+inputs = ["authorized_text"]
+languages = ["python"]
+deterministic = true
+failure_impact = "partial_validation"
+origin = "builtin"
+rule_format_version = 1
+resource_digest = "2b71641b3dfb7b3a4f717b3fb0eddbdabdad7301395c0768b318c317e4aa62e1"
+schema_digest = "02a25956c0e826db877cdba101e3e5447d2e6f16f7fc1d8cb60b1ea57fc22439"
+
+[tools.limits]
+max_input_bytes = 262144
+max_tokens = 65536
+max_rules = 32
+max_steps = 1000000
+max_matches = 1000
+max_output_items = 1000
+max_field_length = 512
+soft_time_ms = 2000
+
+[[tools.rules]]
+id = "python-eval-call"
+op = "token_sequence"
+message = "Dynamic evaluation can execute untrusted code"
+
+[tools.rules.params]
+tokens = ["eval", "("]

@@ -1,0 +1,1 @@
+"""Token budget domain."""
