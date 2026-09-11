@@ -1,0 +1,37 @@
+[policy]
+id = "code-review-agent-default"
+version = 1
+schema_version = 1
+
+[detectors]
+manifest = [
+  "detect-secrets/AWSKeyDetector@1.5.0",
+  "detect-secrets/BasicAuthDetector@1.5.0",
+  "detect-secrets/GitHubTokenDetector@1.5.0",
+  "detect-secrets/GitLabTokenDetector@1.5.0",
+  "detect-secrets/JwtTokenDetector@1.5.0",
+  "detect-secrets/OpenAIDetector@1.5.0",
+  "detect-secrets/PrivateKeyDetector@1.5.0",
+  "detect-secrets/KeywordDetector@1.5.0",
+  "detect-secrets/SlackDetector@1.5.0",
+  "fixed/connection-string@1",
+  "fixed/pem-block@1",
+  "fixed/pii@1",
+  "fixed/business-sensitive@1",
+  "fixed/unknown-sensitive@1",
+]
+
+[actions]
+credential = "redacted"
+private_key = "redacted"
+certificate_material = "redacted"
+connection_string = "redacted"
+cloud_secret = "redacted"
+personal_data = "redacted"
+business_sensitive = "redacted"
+unknown_sensitive = "redacted"
+
+[limits]
+max_bytes = 1048576
+max_findings = 256
+timeout_ms = 1000
