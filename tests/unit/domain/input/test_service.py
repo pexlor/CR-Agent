@@ -209,6 +209,53 @@ def test_binary_dev_null_requires_matching_file_mode(binary_line: str) -> None:
 @pytest.mark.parametrize(
     ("mode_line", "binary_line"),
     [
+        ("new file mode 100644", "Binary files /dev/null and b/image.bin differ"),
+        (
+            "deleted file mode 100644",
+            "Binary files a/image.bin and /dev/null differ",
+        ),
+    ],
+)
+def test_binary_paths_cannot_hide_conflicting_declared_markers(
+    mode_line: str, binary_line: str
+) -> None:
+    content = (
+        "diff --git a/image.bin b/image.bin\n"
+        f"{mode_line}\n"
+        "--- a/image.bin\n"
+        "+++ b/image.bin\n"
+        f"{binary_line}\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+def test_repeated_old_new_marker_pair_is_rejected() -> None:
+    content = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("mode_line", "binary_line"),
+    [
         ("new file mode not-a-mode", "Binary files /dev/null and b/image.bin differ"),
         ("new file mode 10064", "Binary files /dev/null and b/image.bin differ"),
         (
