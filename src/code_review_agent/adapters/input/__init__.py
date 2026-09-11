@@ -1,0 +1,1 @@
+"""Input provider adapters."""

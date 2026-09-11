@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
-from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
-from code_review_agent.domain.input.models import InputLimits
-from code_review_agent.ports.input import InputProviderPort
 
+from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
 from code_review_agent.domain.common.errors import StableError
+from code_review_agent.domain.input.models import InputLimits
 from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
     ArtifactKind,
@@ -20,6 +20,7 @@ from code_review_agent.domain.security.models import (
 )
 from code_review_agent.domain.security.policy import SecurityPolicy
 from code_review_agent.domain.security.service import SecurityService
+from code_review_agent.ports.input import InputProviderPort, SecurityBoundaryPort
 
 
 class CompleteScanner:
@@ -92,6 +93,7 @@ def test_provider_rejects_malformed_utf8_without_retaining_bytes(
         provider().acquire_file(task_id="task-1", path=path)
 
     assert captured.value.code == "input_invalid_utf8"
+    assert captured.value.__cause__ is None
     assert "private-marker" not in repr(captured.value)
     assert str(path) not in str(captured.value.to_dict())
 
@@ -103,4 +105,25 @@ def test_provider_maps_unreadable_file_to_stable_error(tmp_path: Path) -> None:
         provider().acquire_file(task_id="task-1", path=missing)
 
     assert captured.value.code == "input_unreadable"
+    assert captured.value.__cause__ is None
     assert str(missing) not in str(captured.value.to_dict())
+
+
+def test_provider_hides_security_boundary_exception_payload() -> None:
+    marker = "SIMULATED_UNTRUSTED_PAYLOAD"
+
+    class CrashingBoundary:
+        def evaluate_artifact(
+            self, content: str, descriptor: ArtifactDescriptor
+        ) -> object:
+            raise RuntimeError(content)
+
+    value = PlainDiffProvider(cast(SecurityBoundaryPort, CrashingBoundary()))
+
+    with pytest.raises(StableError) as captured:
+        value.acquire_text(task_id="task-1", content=marker)
+
+    assert captured.value.code == "security_boundary_failed"
+    assert captured.value.__cause__ is None
+    assert marker not in repr(captured.value)
+    assert marker not in str(captured.value.to_dict())

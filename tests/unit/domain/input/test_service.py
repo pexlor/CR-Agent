@@ -4,7 +4,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+
 from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
+from code_review_agent.domain.common.errors import StableError
+from code_review_agent.domain.common.time import FixedClock
 from code_review_agent.domain.input.models import (
     ChangeType,
     CompletenessStatus,
@@ -12,9 +15,6 @@ from code_review_agent.domain.input.models import (
     LineType,
 )
 from code_review_agent.domain.input.service import InputService
-
-from code_review_agent.domain.common.errors import StableError
-from code_review_agent.domain.common.time import FixedClock
 from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
     ScanResult,
@@ -149,26 +149,32 @@ def test_text_and_file_forms_build_the_same_stable_review_object() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "content",
-    [
-        "this is not a diff\nSIMULATED_PRIVATE_VALUE",
-        (
-            "diff --git a/app.py b/app.py\n"
-            "--- a/app.py\n"
-            "+++ b/app.py\n"
-            "@@ -1,2 +1,1 @@\n"
-            "-only-one-old-line\n"
-        ),
-    ],
-)
-def test_malformed_input_returns_safe_stable_error(content: str) -> None:
+def test_malformed_input_returns_safe_stable_error() -> None:
+    content = "this is not a diff\nSIMULATED_PRIVATE_VALUE"
+
     with pytest.raises(StableError) as captured:
         make_service().normalize_plain_diff(task_id="task-1", text=content)
 
     assert captured.value.code == "input_malformed"
     assert "SIMULATED_PRIVATE_VALUE" not in repr(captured.value)
     assert "SIMULATED_PRIVATE_VALUE" not in str(captured.value.to_dict())
+
+
+def test_truncated_hunk_is_reported_as_incomplete_without_source_text() -> None:
+    content = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,2 +1,1 @@\n"
+        "-SIMULATED_PARTIAL_VALUE\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_incomplete"
+    assert "SIMULATED_PARTIAL_VALUE" not in repr(captured.value)
+    assert "SIMULATED_PARTIAL_VALUE" not in str(captured.value.to_dict())
 
 
 @pytest.mark.parametrize(
@@ -216,6 +222,22 @@ def test_more_than_200_files_is_rejected_as_a_whole() -> None:
     assert captured.value.details == {"limit": 200, "metric": "files"}
 
 
+def test_exactly_200_files_is_accepted() -> None:
+    content = "".join(
+        f"diff --git a/f{i}.py b/f{i}.py\n"
+        f"--- a/f{i}.py\n"
+        f"+++ b/f{i}.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        for i in range(200)
+    )
+
+    result = make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert result.change_set.file_count == 200
+
+
 def test_more_than_10000_changed_lines_is_rejected_as_a_whole() -> None:
     deleted = "".join(f"-old-{i}\n" for i in range(5_001))
     added = "".join(f"+new-{i}\n" for i in range(5_000))
@@ -232,6 +254,22 @@ def test_more_than_10000_changed_lines_is_rejected_as_a_whole() -> None:
 
     assert captured.value.code == "input_too_large"
     assert captured.value.details == {"limit": 10_000, "metric": "changed_lines"}
+
+
+def test_exactly_10000_changed_lines_is_accepted() -> None:
+    deleted = "".join(f"-old-{i}\n" for i in range(5_000))
+    added = "".join(f"+new-{i}\n" for i in range(5_000))
+    content = (
+        "diff --git a/large.py b/large.py\n"
+        "--- a/large.py\n"
+        "+++ b/large.py\n"
+        "@@ -1,5000 +1,5000 @@\n"
+        f"{deleted}{added}"
+    )
+
+    result = make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert result.change_set.changed_line_count == 10_000
 
 
 def test_sanitized_content_is_referenced_without_raw_diff_in_result() -> None:
