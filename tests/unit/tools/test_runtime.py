@@ -189,6 +189,29 @@ def test_underreported_token_count_cannot_bypass_the_runtime_limit() -> None:
     assert result.evidence == ()
 
 
+def test_numeric_prefixes_use_the_same_lexer_for_token_limits_and_rules() -> None:
+    runtime, declaration = _runtime()
+    text = "123abc"
+    authorized = AuthorizedToolInput(
+        text=text,
+        path="a.py",
+        scope="hunk:1",
+        token_count=tool_contracts.deterministic_tool_token_count(text),
+    )
+    limits = replace(declaration.limits, max_tokens=3)
+
+    result = runtime.execute(
+        declaration.fixed_reference(),
+        authorized,
+        limits,
+        ToolExecutionContext(task_id="task-1", execution_id="attempt-1"),
+    )
+
+    assert result.state is ToolExecutionState.BLOCKED
+    assert result.error_code == "tool_input_tokens_exceeded"
+    assert result.evidence == ()
+
+
 def test_runtime_rejects_an_untrusted_token_count_even_when_under_the_limit() -> None:
     runtime, declaration = _runtime()
     incorrect_count = AuthorizedToolInput(
@@ -313,6 +336,29 @@ def test_untrusted_input_is_never_executed(tmp_path: Path) -> None:
 
     assert result.state is ToolExecutionState.SUCCEEDED
     assert not marker.exists()
+
+
+def test_triple_quoted_multiline_strings_preserve_following_evidence_line() -> None:
+    call_rule = (
+        {
+            "id": "eval-call",
+            "op": "call_name_equals",
+            "message": "eval call",
+            "params": {"name": "eval"},
+        },
+    )
+    runtime, declaration = _runtime(rules=call_rule)
+    text = '"""ignored eval(\n\\\nstill ignored"""\neval(user_input)'
+
+    result = runtime.execute(
+        declaration.fixed_reference(),
+        _authorized_input(text),
+        declaration.limits,
+        ToolExecutionContext(task_id="task-1", execution_id="attempt-1"),
+    )
+
+    assert result.state is ToolExecutionState.SUCCEEDED
+    assert [(item.line, item.column) for item in result.evidence] == [(4, 1)]
 
 
 @pytest.mark.parametrize("text", ("line\r\n", "e\u0301"))

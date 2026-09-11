@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from code_review_agent.adapters.tools import registry as registry_module
 from code_review_agent.adapters.tools.registry import (
     ToolManifestError,
     ToolRegistry,
@@ -208,3 +209,39 @@ def test_excessively_long_numeric_versions_are_rejected_as_manifest_errors() -> 
         registry.register_toml(tool_manifest(version=pathological_version))
 
     assert raised.value.code == "tool_manifest_invalid_identity"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    (
+        b"\xffSENSITIVE_MANIFEST_PAYLOAD",
+        b'manifest_version = "SENSITIVE_MANIFEST_PAYLOAD',
+    ),
+)
+def test_external_parser_errors_retain_no_manifest_payload(manifest: bytes) -> None:
+    with pytest.raises(ToolManifestError) as raised:
+        ToolRegistry().register_toml(manifest)
+
+    assert raised.value.code == "tool_manifest_invalid_toml"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "SENSITIVE_MANIFEST_PAYLOAD" not in str(raised.value)
+    assert "SENSITIVE_MANIFEST_PAYLOAD" not in repr(raised.value)
+
+
+def test_unexpected_normalization_errors_retain_no_parser_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_normalization(value: Any) -> None:
+        del value
+        raise ValueError("SENSITIVE_NORMALIZATION_PAYLOAD")
+
+    monkeypatch.setattr(registry_module, "_parse_tool", fail_normalization)
+
+    with pytest.raises(ToolManifestError) as raised:
+        ToolRegistry().register_toml(tool_manifest())
+
+    assert raised.value.code == "tool_manifest_invalid_field"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "SENSITIVE_NORMALIZATION_PAYLOAD" not in repr(raised.value)
