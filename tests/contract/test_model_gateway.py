@@ -7,6 +7,7 @@ from dataclasses import replace
 import pytest
 
 from code_review_agent.adapters.model.gateway import ModelGateway
+from code_review_agent.domain.common.digests import canonical_json
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.execution.models import (
     ModelCallState,
@@ -47,7 +48,10 @@ def capabilities(
         dynamic_tools_disabled=True,
         request_method="POST",
         request_path="/model",
-        fixed_headers={"accept": "application/json", "content-type": "application/json"},
+        fixed_headers={
+            "accept": "application/json",
+            "content-type": "application/json",
+        },
     )
 
 
@@ -103,6 +107,7 @@ def test_fake_provider_has_fixed_wire_semantics(
 
     prepared = provider.prepare_request(envelope(), options(strategy))
     body = json.loads(prepared.body)
+    expected_schema = json.loads(canonical_json(envelope().output_schema))
 
     assert body["controlled_context"] == ["src/example.py:1"]
     assert body["prohibited_capabilities"] == ["dynamic_tools", "streaming"]
@@ -110,13 +115,13 @@ def test_fake_provider_has_fixed_wire_semantics(
     if strategy is StructuredOutputStrategy.JSON_SCHEMA:
         assert body["structured_output"] == {
             "mode": "json_schema",
-            "schema": dict(envelope().output_schema),
+            "schema": expected_schema,
         }
     elif strategy is StructuredOutputStrategy.TOOL_CALLING:
         assert body["structured_output"] == {
             "mode": "tool_calling",
             "tool": {
-                "input_schema": dict(envelope().output_schema),
+                "input_schema": expected_schema,
                 "name": "submit_review",
             },
         }
@@ -124,16 +129,14 @@ def test_fake_provider_has_fixed_wire_semantics(
         assert body["structured_output"] == {
             "instruction": "return_json_only",
             "mode": "json_text",
-            "schema": dict(envelope().output_schema),
+            "schema": expected_schema,
         }
 
 
 def test_fake_provider_counts_are_not_part_of_shared_contract() -> None:
     provider = FakeModelProvider(capabilities())
 
-    provider.prepare_request(
-        envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
-    )
+    provider.prepare_request(envelope(), options(StructuredOutputStrategy.JSON_SCHEMA))
 
     assert provider.prepare_calls == 1
 

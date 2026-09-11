@@ -21,6 +21,7 @@ def assert_provider_preparation_contract(
 ) -> tuple[PreparedModelRequest, PreparedModelRequest]:
     """Assert deterministic wire semantics without assuming a vendor body shape."""
 
+    assert isinstance(provider, ModelGatewayPort)
     first = provider.prepare_request(envelope, options)
     second = provider.prepare_request(envelope, options)
     capabilities = provider.capabilities
