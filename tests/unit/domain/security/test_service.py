@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from code_review_agent.domain.common.digests import sha256_bytes
 from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
     ArtifactKind,
@@ -76,6 +77,23 @@ def test_safe_artifact_is_not_promoted_before_commit() -> None:
     assert (
         service.resolve(reference, expected_purpose=ArtifactPurpose.DOMAIN_INGRESS)
         == "hello"
+    )
+
+
+def test_empty_artifact_uses_sha256_digest_and_resolves_through_attestation() -> None:
+    service = SecurityService(
+        FakeScanner(ScanResult.complete(())),
+        policy=policy(),
+    )
+
+    prepared = service.evaluate_artifact("", make_descriptor())
+    reference = service.commit(prepared)
+
+    assert prepared.sanitized_digest == sha256_bytes(b"")
+    assert reference.sanitized_digest == sha256_bytes(b"")
+    assert (
+        service.resolve(reference, expected_purpose=ArtifactPurpose.DOMAIN_INGRESS)
+        == ""
     )
 
 

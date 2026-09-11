@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -7,12 +8,14 @@ import pytest
 
 from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
 from code_review_agent.domain.common.errors import StableError
-from code_review_agent.domain.common.time import FixedClock
+from code_review_agent.domain.common.time import Clock, FixedClock
 from code_review_agent.domain.input.models import (
     ChangeType,
     CompletenessStatus,
     CoverageStatus,
+    InputLimits,
     LineType,
+    NormalizedInput,
 )
 from code_review_agent.domain.input.service import InputService
 from code_review_agent.domain.security.models import (
@@ -59,7 +62,9 @@ class Scanner:
         )
 
 
-def make_service(marker: str | None = None) -> InputService:
+def make_service(
+    marker: str | None = None, *, clock: Clock | None = None
+) -> InputService:
     policy = SecurityPolicy(
         policy_id="input-test",
         policy_version=1,
@@ -75,7 +80,7 @@ def make_service(marker: str | None = None) -> InputService:
     return InputService(
         PlainDiffProvider(security),
         security,
-        clock=FixedClock(datetime(2026, 9, 10, 8, 0, tzinfo=UTC)),
+        clock=clock or FixedClock(datetime(2026, 9, 10, 8, 0, tzinfo=UTC)),
     )
 
 
@@ -92,6 +97,40 @@ def test_empty_diff_is_complete_no_change_input() -> None:
     assert result.change_set.completeness.status is CompletenessStatus.COMPLETE
     assert result.change_set.coverage.status is CoverageStatus.COMPLETE
     assert result.binding.content_digest == result.change_set.identity.content_digest
+
+
+def test_empty_diff_is_resolved_through_security_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = SecurityPolicy(
+        policy_id="empty-input",
+        policy_version=1,
+        schema_version=1,
+        sensitive_categories=frozenset({SensitiveCategory.CREDENTIAL}),
+        detector_manifest=("fixture-scanner@1",),
+        action_matrix={SensitiveCategory.CREDENTIAL: SecurityDecision.REDACTED},
+        purpose_transitions=frozenset(),
+    )
+    security = SecurityService(Scanner(), policy=policy)
+    original_resolve = security.resolve
+    resolved = 0
+
+    def recording_resolve(*args: object, **kwargs: object) -> str:
+        nonlocal resolved
+        resolved += 1
+        return original_resolve(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(security, "resolve", recording_resolve)
+    service = InputService(
+        PlainDiffProvider(security),
+        security,
+        clock=FixedClock(datetime(2026, 9, 10, 8, 0, tzinfo=UTC)),
+    )
+
+    result = service.normalize_plain_diff(task_id="task-1", text="")
+
+    assert result.change_set.files == ()
+    assert resolved == 1
 
 
 def test_pure_deletion_preserves_old_side_line_location() -> None:
@@ -135,6 +174,88 @@ def test_binary_file_is_complete_input_but_unreviewable_scope() -> None:
     assert result.change_set.coverage.unreviewable_file_ids == (changed_file.file_id,)
 
 
+def test_deleted_binary_uses_dev_null_without_changing_header_path() -> None:
+    content = (
+        "diff --git a/image.bin b/image.bin\n"
+        "deleted file mode 100644\n"
+        "Binary files a/image.bin and /dev/null differ\n"
+    )
+
+    result = make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    changed_file = result.change_set.files[0]
+    assert changed_file.old_path == "image.bin"
+    assert changed_file.new_path is None
+
+
+@pytest.mark.parametrize(
+    "binary_line",
+    [
+        "Binary files a/other.bin and b/image.bin differ",
+        "Binary files a/image.bin and b/other.bin differ",
+        "Binary files /dev/null and b/other.bin differ",
+    ],
+)
+def test_binary_paths_cannot_replace_diff_header_identity(binary_line: str) -> None:
+    content = (
+        f"diff --git a/image.bin b/image.bin\nnew file mode 100644\n{binary_line}\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+    assert "other.bin" not in str(captured.value.to_dict())
+
+
+@pytest.mark.parametrize(
+    "mode_lines",
+    [
+        "new file mode 100644\ndeleted file mode 100644\n",
+        "new file mode 100644\n",
+    ],
+)
+def test_conflicting_binary_file_modes_are_stable_malformed_errors(
+    mode_lines: str,
+) -> None:
+    content = (
+        "diff --git a/image.bin b/image.bin\n"
+        f"{mode_lines}"
+        "Binary files a/image.bin and b/image.bin differ\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+def test_duplicate_file_sections_are_rejected() -> None:
+    content = fixture("basic.diff") + fixture("basic.diff")
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+def test_aggregation_value_error_is_mapped_without_exception_chain() -> None:
+    class InvalidClock:
+        def now(self) -> datetime:
+            return datetime(2026, 9, 10, 8, 0)
+
+    with pytest.raises(StableError) as captured:
+        make_service(clock=InvalidClock()).normalize_plain_diff(
+            task_id="task-1", text=fixture("basic.diff")
+        )
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
 def test_text_and_file_forms_build_the_same_stable_review_object() -> None:
     text = fixture("basic.diff")
     text_result = make_service().normalize_plain_diff(task_id="task-1", text=text)
@@ -173,6 +294,7 @@ def test_truncated_hunk_is_reported_as_incomplete_without_source_text() -> None:
         make_service().normalize_plain_diff(task_id="task-1", text=content)
 
     assert captured.value.code == "input_incomplete"
+    assert captured.value.__cause__ is None
     assert "SIMULATED_PARTIAL_VALUE" not in repr(captured.value)
     assert "SIMULATED_PARTIAL_VALUE" not in str(captured.value.to_dict())
 
@@ -202,6 +324,117 @@ def test_dangerous_diff_paths_are_rejected_without_echoing_them(
 
     assert captured.value.code == "input_malformed"
     assert old_path not in str(captured.value.to_dict())
+
+
+def test_nonempty_hunk_range_requires_a_positive_start() -> None:
+    content = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -0,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+
+
+@pytest.mark.parametrize(
+    "second_header",
+    [
+        "@@ -5,1 +5,1 @@",
+        "@@ -11,1 +11,1 @@",
+    ],
+)
+def test_hunks_must_be_ordered_and_nonoverlapping(second_header: str) -> None:
+    content = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        " keep-10\n"
+        "-old-11\n"
+        "+new-11\n"
+        " keep-12\n"
+        f"{second_header}\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+
+
+@pytest.mark.parametrize(
+    "proof_updates",
+    [
+        {"input_identity_digest": "0" * 64},
+        {"provider_id": "other"},
+        {"provider_version": "2"},
+        {"fixed_version": "f" * 64},
+        {"byte_count": 1},
+        {"file_count": 2},
+        {"changed_line_count": 3},
+        {"limits": InputLimits(max_files=199)},
+        {"normalization_version": "other"},
+    ],
+)
+def test_change_set_rejects_mismatched_completeness_proof(
+    proof_updates: dict[str, object],
+) -> None:
+    change_set = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
+        .change_set
+    )
+    forged_proof = replace(change_set.completeness, **proof_updates)
+
+    with pytest.raises(ValueError):
+        replace(change_set, completeness=forged_proof)
+
+
+def test_change_set_coverage_must_exactly_classify_every_file() -> None:
+    change_set = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("binary.diff"))
+        .change_set
+    )
+    forged_coverage = replace(
+        change_set.coverage,
+        status=CoverageStatus.COMPLETE,
+        reviewable_file_ids=(),
+        unreviewable_file_ids=(),
+    )
+
+    with pytest.raises(ValueError):
+        replace(change_set, coverage=forged_coverage)
+
+
+@pytest.mark.parametrize(
+    "binding_updates",
+    [
+        {"input_type": "github_pr"},
+        {"object_identity": "forged"},
+        {"changeset_ref": "forged"},
+        {"base_sha": "a" * 40},
+        {"head_sha": "b" * 40},
+    ],
+)
+def test_normalized_input_rejects_mismatched_binding(
+    binding_updates: dict[str, object],
+) -> None:
+    result = make_service().normalize_plain_diff(
+        task_id="task-1", text=fixture("basic.diff")
+    )
+    forged_binding = replace(result.binding, **binding_updates)
+
+    with pytest.raises(ValueError):
+        NormalizedInput(change_set=result.change_set, binding=forged_binding)
 
 
 def test_more_than_200_files_is_rejected_as_a_whole() -> None:

@@ -198,3 +198,13 @@ def test_fixed_reference_detects_any_manifest_drift() -> None:
     with pytest.raises(ToolManifestError) as raised:
         registry.verify_fixed_reference(stale)
     assert raised.value.code == "tool_reference_mismatch"
+
+
+def test_excessively_long_numeric_versions_are_rejected_as_manifest_errors() -> None:
+    registry = ToolRegistry()
+    pathological_version = f"1.{('9' * 10_000)}.0"
+
+    with pytest.raises(ToolManifestError) as raised:
+        registry.register_toml(tool_manifest(version=pathological_version))
+
+    assert raised.value.code == "tool_manifest_invalid_identity"
