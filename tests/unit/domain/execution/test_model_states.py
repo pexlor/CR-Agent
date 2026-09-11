@@ -210,3 +210,33 @@ def test_model_outcome_payload_rejects_non_strict_json() -> None:
             overage_tokens=0,
             response_payload={"findings": {"not-json"}},
         )
+
+
+@pytest.mark.parametrize("container", ("provider_result", "outcome"))
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (("input_tokens", True), ("state", "known")),
+)
+def test_usage_containers_revalidate_exact_model_usage(
+    container: str, field: str, invalid_value: object
+) -> None:
+    usage = ModelUsage(UsageState.KNOWN, 3, 2)
+    object.__setattr__(usage, field, invalid_value)
+
+    with pytest.raises(TypeError, match="usage"):
+        if container == "provider_result":
+            ProviderSendResult(
+                provider_state=ProviderState.SUCCEEDED,
+                request_sent=True,
+                response_payload={"findings": []},
+                usage=usage,
+            )
+        else:
+            ModelCallOutcome(
+                state=ModelCallState(ProviderState.SUCCEEDED, ResponseState.PENDING),
+                reservation_action=ReservationAction.SETTLE_KNOWN,
+                usage=usage,
+                accounted_tokens=5,
+                overage_tokens=0,
+                response_payload={"findings": []},
+            )

@@ -955,6 +955,43 @@ async def test_provider_result_subclass_cannot_override_validation() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "expected_state", "expected_accounted"),
+    (
+        ("input_tokens", True, UsageState.MISSING, 500),
+        ("state", "known", UsageState.UNTRUSTED, 550),
+    ),
+)
+async def test_mutated_nested_usage_is_conservatively_unknown(
+    field: str,
+    invalid_value: object,
+    expected_state: UsageState,
+    expected_accounted: int,
+) -> None:
+    usage = ModelUsage(UsageState.KNOWN, 300, 250)
+    result = ProviderSendResult(
+        provider_state=ProviderState.SUCCEEDED,
+        request_sent=True,
+        response_payload={"findings": []},
+        usage=usage,
+    )
+    object.__setattr__(usage, field, invalid_value)
+    provider = FakeModelProvider(capabilities(), (result,))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    reservation = reservation_for(prepared)
+
+    outcome = await gateway.send(provider, prepared, reservation=reservation)
+
+    assert outcome.state.provider_state is ProviderState.UNKNOWN
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.usage.state is expected_state
+    assert outcome.accounted_tokens == expected_accounted
+
+
+@pytest.mark.asyncio
 async def test_cancelled_send_propagates_and_discards_both_permits() -> None:
     class CancelledProvider(FakeModelProvider):
         async def send_prepared(
