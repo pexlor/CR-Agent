@@ -26,11 +26,11 @@ from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
     ArtifactKind,
     ArtifactPurpose,
+    ArtifactSource,
     ScanResult,
     SecurityDecision,
     SecurityFinding,
     SensitiveCategory,
-    ArtifactSource,
 )
 from code_review_agent.domain.security.policy import SecurityPolicy
 from code_review_agent.domain.security.service import SecurityService
@@ -585,9 +585,10 @@ def test_space_path_header_parsing_is_linear(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(input_service_module, "_normalize_path", counting_normalize)
 
-    assert input_service_module._parse_diff_header(
-        f"diff --git a/{path} b/{path}"
-    ) == (path, path)
+    assert input_service_module._parse_diff_header(f"diff --git a/{path} b/{path}") == (
+        path,
+        path,
+    )
     assert calls <= 4
 
 
@@ -1086,13 +1087,16 @@ def test_extended_metadata_requires_consistent_content_facts(content: str) -> No
 def test_change_set_rejects_invalid_security_ref_after_coordinated_rehash(
     reference_updates: dict[str, object],
 ) -> None:
-    change_set = make_service().normalize_plain_diff(task_id="task-1", text="").change_set
+    change_set = (
+        make_service().normalize_plain_diff(task_id="task-1", text="").change_set
+    )
     forged_reference = replace(
         change_set.sanitized_diff_ref,
         **cast(Any, reference_updates),
     )
     forged_digest = derive_change_set_digest(
         change_set_id=change_set.change_set_id,
+        task_id=change_set.task_id,
         schema_version=change_set.schema_version,
         identity=change_set.identity,
         files=change_set.files,

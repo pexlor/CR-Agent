@@ -42,7 +42,7 @@ from code_review_agent.ports.input import InputProviderPort, SecurityBoundaryPor
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _GIT_FILE_MODE = re.compile(r"^(?:100644|100755|120000|160000)$")
-_SIMILARITY = re.compile(r"^(similarity|dissimilarity) index (?:0|[1-9][0-9]?|100)%$")
+_SIMILARITY = re.compile(r"^(similarity|dissimilarity) index (0|[1-9][0-9]?|100)%$")
 _INDEX = re.compile(
     r"^index ([0-9a-f]{4,64})\.\.([0-9a-f]{4,64})"
     r"(?: (100644|100755|120000|160000))?$"
@@ -153,6 +153,7 @@ class InputService:
         )
         change_set_digest = derive_change_set_digest(
             change_set_id=change_set_id,
+            task_id=task_id,
             schema_version=SCHEMA_VERSION,
             identity=acquired.identity,
             files=files,
@@ -186,6 +187,7 @@ class InputService:
         )
         change_set = ChangeSet(
             change_set_id=change_set_id,
+            task_id=task_id,
             schema_version=SCHEMA_VERSION,
             identity=acquired.identity,
             completeness=completeness,
@@ -256,7 +258,7 @@ class _UnifiedDiffParser:
     def parse(self) -> tuple[ChangedFile, ...]:
         if self._content == "":
             return ()
-        lines = _physical_lines(self._content)
+        lines = _physical_lines(self._content, self._limits.max_physical_lines)
         if not lines or not lines[0].body.startswith("diff --git "):
             raise _MalformedDiff
         sections: list[tuple[_PhysicalLine, ...]] = []
@@ -270,13 +272,9 @@ class _UnifiedDiffParser:
             raise _TooLarge("files", self._limits.max_files)
 
         files: list[ChangedFile] = []
-        seen_sections: set[tuple[str, str]] = set()
+        seen_file_ids: set[str] = set()
         changed_line_count = 0
         for section in sections:
-            section_identity = _parse_diff_header(section[0].body)
-            if section_identity in seen_sections:
-                raise _MalformedDiff
-            seen_sections.add(section_identity)
             changed_file = self._parse_file(
                 section,
                 remaining_changed_lines=(
@@ -286,6 +284,9 @@ class _UnifiedDiffParser:
             changed_line_count += changed_file.additions + changed_file.deletions
             if changed_line_count > self._limits.max_changed_lines:
                 raise _TooLarge("changed_lines", self._limits.max_changed_lines)
+            if changed_file.file_id in seen_file_ids:
+                raise _MalformedDiff
+            seen_file_ids.add(changed_file.file_id)
             files.append(changed_file)
         return tuple(files)
 
@@ -295,7 +296,10 @@ class _UnifiedDiffParser:
         *,
         remaining_changed_lines: int,
     ) -> ChangedFile:
-        header_old, header_new = _parse_diff_header(lines[0].body)
+        header_old, header_new = _parse_diff_header(
+            lines[0].body,
+            hints=_header_path_hints(lines),
+        )
         marker_old: str | None = header_old
         marker_new: str | None = header_new
         has_markers = False
@@ -307,7 +311,7 @@ class _UnifiedDiffParser:
         recognized_fact = False
         rename_old: str | None = None
         rename_new: str | None = None
-        similarity_kind: str | None = None
+        similarity: tuple[str, int] | None = None
         old_mode: str | None = None
         new_mode: str | None = None
         index_metadata: tuple[str, str, str | None] | None = None
@@ -364,9 +368,9 @@ class _UnifiedDiffParser:
                 "dissimilarity index "
             ):
                 match = _SIMILARITY.fullmatch(body)
-                if match is None or similarity_kind is not None:
+                if match is None or similarity is not None:
                     raise _MalformedDiff
-                similarity_kind = match.group(1)
+                similarity = (match.group(1), int(match.group(2)))
                 recognized_fact = True
             elif body.startswith("new file mode "):
                 if new_file or not _GIT_FILE_MODE.fullmatch(
@@ -403,7 +407,7 @@ class _UnifiedDiffParser:
             elif body.startswith("Binary files ") and body.endswith(" differ"):
                 if binary_paths is not None:
                     raise _MalformedDiff
-                binary_paths = _parse_binary_paths(body)
+                binary_paths = _parse_binary_paths(body, header_old, header_new)
                 binary = True
                 recognized_fact = True
             elif body == "GIT binary patch":
@@ -436,6 +440,8 @@ class _UnifiedDiffParser:
             new_is_zero = set(index_metadata[1]) == {"0"}
             if old_is_zero != new_file or new_is_zero != deleted_file:
                 raise _MalformedDiff
+        similarity_kind = similarity[0] if similarity is not None else None
+        similarity_percent = similarity[1] if similarity is not None else None
         if similarity_kind == "similarity" and (
             rename_old is None or rename_new is None
         ):
@@ -488,6 +494,22 @@ class _UnifiedDiffParser:
             raise _MalformedDiff
         if binary and hunk_drafts:
             raise _MalformedDiff
+        has_content = bool(hunk_drafts or binary)
+        if similarity_kind == "dissimilarity" and not has_content:
+            raise _MalformedDiff
+        if similarity_kind == "similarity" and (
+            (similarity_percent == 100 and has_content)
+            or (similarity_percent != 100 and not has_content)
+        ):
+            raise _MalformedDiff
+        if index_metadata is not None:
+            old_hash, new_hash, _ = index_metadata
+            hashes_differ = old_hash != new_hash
+            lifecycle_only = (new_file or deleted_file) and not has_content
+            if not has_content and not lifecycle_only:
+                raise _MalformedDiff
+            if not hashes_differ and has_content:
+                raise _MalformedDiff
 
         if binary:
             change_type = ChangeType.BINARY
@@ -720,36 +742,95 @@ class _TooLarge(Exception):
         self.limit = limit
 
 
-def _physical_lines(content: str) -> tuple[_PhysicalLine, ...]:
+def _physical_lines(content: str, max_lines: int) -> tuple[_PhysicalLine, ...]:
     values: list[_PhysicalLine] = []
     offset = 0
-    for raw in content.splitlines(keepends=True):
-        body = raw[:-1] if raw.endswith("\n") else raw
+    while offset < len(content):
+        if len(values) >= max_lines:
+            raise _TooLarge("physical_lines", max_lines)
+        newline = content.find("\n", offset)
+        if newline < 0:
+            body = content[offset:]
+            next_offset = len(content)
+        else:
+            body = content[offset:newline]
+            next_offset = newline + 1
         values.append(_PhysicalLine(body=body, start=offset))
-        offset += len(raw)
+        offset = next_offset
     return tuple(values)
 
 
-def _parse_diff_header(header: str) -> tuple[str, str]:
+def _header_path_hints(
+    lines: tuple[_PhysicalLine, ...],
+) -> tuple[str, str] | None:
+    rename_old: str | None = None
+    rename_new: str | None = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.body.startswith("@@"):
+            break
+        if line.body.startswith("--- ") and index + 1 < len(lines):
+            next_body = lines[index + 1].body
+            if next_body.startswith("+++ "):
+                old_path = _parse_marker_path(line.body[4:], "a/")
+                new_path = _parse_marker_path(next_body[4:], "b/")
+                if old_path is None and new_path is not None:
+                    return new_path, new_path
+                if new_path is None and old_path is not None:
+                    return old_path, old_path
+                if old_path is not None and new_path is not None:
+                    return old_path, new_path
+        elif line.body.startswith("rename from ") and rename_old is None:
+            rename_old = _normalize_path(
+                _decode_git_path_field(line.body.removeprefix("rename from ")),
+                None,
+            )
+        elif line.body.startswith("rename to ") and rename_new is None:
+            rename_new = _normalize_path(
+                _decode_git_path_field(line.body.removeprefix("rename to ")),
+                None,
+            )
+    if rename_old is not None and rename_new is not None:
+        return rename_old, rename_new
+    return None
+
+
+def _parse_diff_header(
+    header: str,
+    *,
+    hints: tuple[str, str] | None = None,
+) -> tuple[str, str]:
     prefix = "diff --git "
     if not header.startswith(prefix):
         raise _MalformedDiff
     payload = header[len(prefix) :]
-    candidates: list[tuple[str, str]] = []
-    for index, character in enumerate(payload):
-        if character != " ":
-            continue
-        try:
-            old_path = _normalize_path(_decode_git_path_field(payload[:index]), "a/")
-            new_path = _normalize_path(
-                _decode_git_path_field(payload[index + 1 :]), "b/"
-            )
-        except _MalformedDiff:
-            continue
-        candidates.append((old_path, new_path))
-    if len(candidates) != 1:
+    if payload.startswith('"'):
+        old_value, consumed = _consume_c_style_path(payload)
+        if consumed >= len(payload) or payload[consumed] != " ":
+            raise _MalformedDiff
+        new_value = _decode_git_path_field(payload[consumed + 1 :])
+        return _normalize_path(old_value, "a/"), _normalize_path(new_value, "b/")
+    if hints is not None:
+        expected = f"a/{hints[0]} b/{hints[1]}"
+        if payload != expected:
+            raise _MalformedDiff
+        return hints
+    symmetric_length, remainder = divmod(len(payload) - 5, 2)
+    if remainder == 0 and symmetric_length >= 0:
+        separator = 2 + symmetric_length
+        if payload[separator : separator + 3] == " b/":
+            old_value = payload[:separator]
+            new_value = payload[separator + 1 :]
+            old_path = _normalize_path(old_value, "a/")
+            new_path = _normalize_path(new_value, "b/")
+            if old_path == new_path:
+                return old_path, new_path
+    first = payload.find(" b/", 2)
+    if first < 0 or first != payload.rfind(" b/"):
         raise _MalformedDiff
-    return candidates[0]
+    return (
+        _normalize_path(payload[:first], "a/"),
+        _normalize_path(payload[first + 1 :], "b/"),
+    )
 
 
 def _parse_marker_path(value: str, prefix: str) -> str | None:
@@ -765,32 +846,34 @@ def _parse_marker_path(value: str, prefix: str) -> str | None:
     return _normalize_path(token, prefix)
 
 
-def _parse_binary_paths(value: str) -> tuple[str | None, str | None]:
+def _parse_binary_paths(
+    value: str,
+    header_old: str,
+    header_new: str,
+) -> tuple[str | None, str | None]:
     pair = value.removeprefix("Binary files ").removesuffix(" differ")
-    candidates: list[tuple[str | None, str | None]] = []
-    cursor = 0
-    while True:
-        separator = pair.find(" and ", cursor)
-        if separator < 0:
-            break
-        try:
-            old_value = _decode_git_path_field(pair[:separator])
-            new_value = _decode_git_path_field(pair[separator + 5 :])
-            old_path = (
-                None if old_value == "/dev/null" else _normalize_path(old_value, "a/")
-            )
-            new_path = (
-                None if new_value == "/dev/null" else _normalize_path(new_value, "b/")
-            )
-        except _MalformedDiff:
-            cursor = separator + 1
-            continue
-        if old_path is not None or new_path is not None:
-            candidates.append((old_path, new_path))
-        cursor = separator + 1
-    if len(candidates) != 1:
-        raise _MalformedDiff
-    return candidates[0]
+    candidates = (
+        (f"a/{header_old}", f"b/{header_new}", header_old, header_new),
+        ("/dev/null", f"b/{header_new}", None, header_new),
+        (f"a/{header_old}", "/dev/null", header_old, None),
+    )
+    matches = [
+        (old_path, new_path)
+        for old_value, new_value, old_path, new_path in candidates
+        if pair == f"{old_value} and {new_value}"
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if pair.startswith('"'):
+        old_value, consumed = _consume_c_style_path(pair)
+        if pair[consumed : consumed + 5] != " and ":
+            raise _MalformedDiff
+        new_value = _decode_git_path_field(pair[consumed + 5 :])
+        old_path = _normalize_path(old_value, "a/")
+        new_path = _normalize_path(new_value, "b/")
+        if old_path == header_old and new_path == header_new:
+            return old_path, new_path
+    raise _MalformedDiff
 
 
 def _decode_git_path_field(value: str) -> str:

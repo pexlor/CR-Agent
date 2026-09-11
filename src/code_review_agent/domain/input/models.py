@@ -14,6 +14,7 @@ from code_review_agent.domain.common.time import ensure_utc
 from code_review_agent.domain.security.models import (
     ArtifactKind,
     ArtifactPurpose,
+    ArtifactSource,
     SanitizedArtifactRef,
     SecurityDecision,
 )
@@ -54,9 +55,18 @@ class InputLimits:
     max_bytes: int = 1_048_576
     max_files: int = 200
     max_changed_lines: int = 10_000
+    max_physical_lines: int = 20_000
 
     def __post_init__(self) -> None:
-        if min(self.max_bytes, self.max_files, self.max_changed_lines) <= 0:
+        if (
+            min(
+                self.max_bytes,
+                self.max_files,
+                self.max_changed_lines,
+                self.max_physical_lines,
+            )
+            <= 0
+        ):
             raise ValueError("input limits must be positive")
 
 
@@ -117,6 +127,7 @@ class AcquiredPlainDiff:
     def __post_init__(self) -> None:
         if self.byte_count < 0:
             raise ValueError("byte count must be non-negative")
+        _validate_plain_diff_artifact(self.artifact_ref, self.identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +391,7 @@ class CompletenessProof:
                     self.limits.max_bytes,
                     self.limits.max_files,
                     self.limits.max_changed_lines,
+                    self.limits.max_physical_lines,
                 ],
                 "checks": [
                     self.pagination_contiguous,
@@ -400,6 +412,7 @@ class CompletenessProof:
 @dataclass(frozen=True, slots=True)
 class ChangeSet:
     change_set_id: str
+    task_id: str
     schema_version: str
     identity: InputIdentity
     completeness: CompletenessProof
@@ -415,7 +428,11 @@ class ChangeSet:
     created_at: datetime
 
     def __post_init__(self) -> None:
-        if not self.change_set_id or not _SHA256.fullmatch(self.change_set_digest):
+        if (
+            not self.change_set_id
+            or not self.task_id
+            or not _SHA256.fullmatch(self.change_set_digest)
+        ):
             raise ValueError("change set identity and digest are required")
         if self.file_count != len(self.files):
             raise ValueError("change set file count mismatch")
@@ -482,12 +499,7 @@ class ChangeSet:
         if set(self.coverage.reviewable_file_ids) != expected_reviewable:
             raise ValueError("coverage does not match reviewable files")
         reference = self.sanitized_diff_ref
-        if (
-            reference.kind is not ArtifactKind.DIFF
-            or reference.purpose is not ArtifactPurpose.DOMAIN_INGRESS
-            or reference.artifact_id != f"plain-diff-{self.identity.identity_digest}"
-        ):
-            raise ValueError("change set security artifact identity mismatch")
+        _validate_plain_diff_artifact(reference, self.identity, self.task_id)
         if any(
             line.content_ref.artifact != reference
             for changed_file in self.files
@@ -499,6 +511,7 @@ class ChangeSet:
             )
         expected_digest = derive_change_set_digest(
             change_set_id=self.change_set_id,
+            task_id=self.task_id,
             schema_version=self.schema_version,
             identity=self.identity,
             files=self.files,
@@ -559,11 +572,7 @@ def derive_line_id(
             "new_line_number": new_line_number,
             "sequence": sequence,
             "content_ref": {
-                "artifact_id": content_ref.artifact.artifact_id,
-                "kind": content_ref.artifact.kind.value,
-                "purpose": content_ref.artifact.purpose.value,
-                "sanitized_digest": content_ref.artifact.sanitized_digest,
-                "policy_digest": content_ref.artifact.policy_digest,
+                "artifact": _artifact_ref_payload(content_ref.artifact),
                 "start": content_ref.start,
                 "end": content_ref.end,
                 "content_digest": content_ref.content_digest,
@@ -683,6 +692,7 @@ def derive_change_set_id(identity: InputIdentity) -> str:
 def derive_change_set_digest(
     *,
     change_set_id: str,
+    task_id: str,
     schema_version: str,
     identity: InputIdentity,
     files: Sequence[ChangedFile],
@@ -696,6 +706,7 @@ def derive_change_set_digest(
     return sha256_digest(
         {
             "change_set_id": change_set_id,
+            "task_id": task_id,
             "schema_version": schema_version,
             "identity": identity.identity_digest,
             "files": [_file_digest_payload(item) for item in files],
@@ -704,6 +715,7 @@ def derive_change_set_digest(
                 limits.max_bytes,
                 limits.max_files,
                 limits.max_changed_lines,
+                limits.max_physical_lines,
             ],
             "coverage": {
                 "status": coverage.status.value,
@@ -711,16 +723,7 @@ def derive_change_set_digest(
                 "unreviewable": list(coverage.unreviewable_file_ids),
                 "safely_skipped": list(coverage.safely_skipped_file_ids),
             },
-            "security": {
-                "artifact_id": sanitized_diff_ref.artifact_id,
-                "kind": sanitized_diff_ref.kind.value,
-                "purpose": sanitized_diff_ref.purpose.value,
-                "decision": sanitized_diff_ref.decision.value,
-                "sanitized_digest": sanitized_diff_ref.sanitized_digest,
-                "policy_id": sanitized_diff_ref.policy_id,
-                "policy_version": sanitized_diff_ref.policy_version,
-                "policy_digest": sanitized_diff_ref.policy_digest,
-            },
+            "security": _artifact_ref_payload(sanitized_diff_ref),
             "normalization_version": normalization_version,
         }
     )
@@ -765,6 +768,40 @@ def _file_digest_payload(changed_file: ChangedFile) -> dict[str, object]:
             for hunk in changed_file.hunks
         ],
     }
+
+
+def _artifact_ref_payload(reference: SanitizedArtifactRef) -> dict[str, object]:
+    return {
+        "artifact_id": reference.artifact_id,
+        "task_id": reference.task_id,
+        "source": reference.source.value,
+        "kind": reference.kind.value,
+        "purpose": reference.purpose.value,
+        "decision": reference.decision.value,
+        "sanitized_digest": reference.sanitized_digest,
+        "policy_id": reference.policy_id,
+        "policy_version": reference.policy_version,
+        "policy_digest": reference.policy_digest,
+        "provenance": list(reference.provenance),
+    }
+
+
+def _validate_plain_diff_artifact(
+    reference: SanitizedArtifactRef,
+    identity: InputIdentity,
+    expected_task_id: str | None = None,
+) -> None:
+    if (
+        reference.task_id is None
+        or (expected_task_id is not None and reference.task_id != expected_task_id)
+        or reference.source is not ArtifactSource.USER_CLI
+        or reference.kind is not ArtifactKind.DIFF
+        or reference.purpose is not ArtifactPurpose.DOMAIN_INGRESS
+        or reference.decision not in (SecurityDecision.SAFE, SecurityDecision.REDACTED)
+        or reference.artifact_id != f"plain-diff-{identity.identity_digest}"
+        or reference.provenance
+    ):
+        raise ValueError("plain diff security artifact identity mismatch")
 
 
 def _validate_line_locations(hunk: Hunk) -> None:

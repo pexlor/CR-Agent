@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 
 import pytest
+
 from code_review_agent.domain.input.models import (
     ChangeType,
     CompletenessStatus,
