@@ -12,6 +12,28 @@ from code_review_agent.domain.common.digests import sha256_digest
 type RuleParameter = str | int | tuple[str, ...]
 
 
+def deterministic_tool_token_count(text: str) -> int:
+    """Count finite-language tokens without trusting caller-provided metadata."""
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    count = 0
+    in_identifier = False
+    for char in text:
+        is_identifier = char.isalnum() or char == "_"
+        if is_identifier:
+            if not in_identifier:
+                count += 1
+        elif not char.isspace():
+            count += 1
+        in_identifier = is_identifier
+    return count
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
 class ToolExecutionState(StrEnum):
     SUCCEEDED = "succeeded"
     BLOCKED = "blocked"
@@ -184,7 +206,7 @@ class AuthorizedToolInput:
                 "text": self.text,
                 "path": self.path,
                 "scope": self.scope,
-                "token_count": self.token_count,
+                "token_count": deterministic_tool_token_count(self.text),
                 "changed_lines": list(self.changed_lines),
             }
         )
@@ -194,10 +216,15 @@ class AuthorizedToolInput:
 class ToolExecutionContext:
     task_id: str
     execution_id: str
+    expected_success_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id or not self.execution_id:
             raise ValueError("execution context identifiers must be non-empty")
+        if self.expected_success_digest is not None and not _is_sha256(
+            self.expected_success_digest
+        ):
+            raise ValueError("expected_success_digest must be a SHA-256 digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +270,10 @@ class ToolCatalogPort(Protocol):
     def verify_fixed_reference(
         self, reference: FixedToolReference
     ) -> ToolDeclaration: ...
+
+    def disable_version(
+        self, reference: FixedToolReference, *, reason: str
+    ) -> None: ...
 
 
 class RestrictedToolRuntimePort(Protocol):

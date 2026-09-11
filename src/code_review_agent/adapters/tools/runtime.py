@@ -13,15 +13,15 @@ from code_review_agent.ports.tools import (
     DeclarativeRule,
     FixedToolReference,
     RestrictedToolRuntimePort,
+    ToolCatalogPort,
     ToolDeclaration,
     ToolEvidence,
     ToolExecutionContext,
     ToolExecutionResult,
     ToolExecutionState,
     ToolLimits,
+    deterministic_tool_token_count,
 )
-
-from .registry import ToolRegistry
 
 INTERPRETER_VERSION = "1.0.0"
 
@@ -84,11 +84,11 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
 
     def __init__(
         self,
-        registry: ToolRegistry,
+        catalog: ToolCatalogPort,
         *,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._registry = registry
+        self._catalog = catalog
         self._monotonic = monotonic
 
     def execute(
@@ -98,10 +98,32 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
         planned_limits: ToolLimits,
         execution_context: ToolExecutionContext,
     ) -> ToolExecutionResult:
-        del execution_context
-        declaration = self._registry.verify_fixed_reference(fixed_tool_ref)
+        declaration = self._catalog.verify_fixed_reference(fixed_tool_ref)
         limits = declaration.limits.constrained_by(planned_limits)
         input_digest = authorized_input.input_digest
+
+        if len(declaration.rules) > limits.max_rules:
+            return self._result(
+                declaration=declaration,
+                input_digest=input_digest,
+                limits=limits,
+                state=ToolExecutionState.FAILED_KNOWN,
+                steps=0,
+                evidence=(),
+                error_code="tool_max_rules_exceeded",
+            )
+        if not self._output_fields_fit(
+            declaration, authorized_input, input_digest, limits
+        ):
+            return self._result(
+                declaration=declaration,
+                input_digest=input_digest,
+                limits=limits,
+                state=ToolExecutionState.FAILED_KNOWN,
+                steps=0,
+                evidence=(),
+                error_code="tool_max_field_length_exceeded",
+            )
 
         normalization_error = self._validate_input(authorized_input, limits)
         if normalization_error is not None:
@@ -167,7 +189,7 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
             )
             for ordinal, match in enumerate(ordered, start=1)
         )
-        return self._result(
+        success = self._result(
             declaration=declaration,
             input_digest=input_digest,
             limits=limits,
@@ -176,6 +198,21 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
             evidence=evidence,
             error_code=None,
         )
+        expected_digest = execution_context.expected_success_digest
+        if expected_digest is not None and success.result_digest != expected_digest:
+            self._catalog.disable_version(
+                fixed_tool_ref, reason="determinism_violation"
+            )
+            return self._result(
+                declaration=declaration,
+                input_digest=input_digest,
+                limits=limits,
+                state=ToolExecutionState.DETERMINISM_VIOLATION,
+                steps=budget.steps,
+                evidence=(),
+                error_code="tool_determinism_violation",
+            )
+        return success
 
     @staticmethod
     def _validate_input(
@@ -189,14 +226,44 @@ class RestrictedToolRuntime(RestrictedToolRuntimePort):
             return "tool_input_not_normalized"
         if len(authorized_input.text.encode("utf-8")) > limits.max_input_bytes:
             return "tool_input_bytes_exceeded"
-        if authorized_input.token_count > limits.max_tokens:
+        actual_token_count = deterministic_tool_token_count(authorized_input.text)
+        if actual_token_count > limits.max_tokens:
             return "tool_input_tokens_exceeded"
-        if (
-            len(authorized_input.path) > limits.max_field_length
-            or len(authorized_input.scope) > limits.max_field_length
-        ):
-            return "tool_input_field_length_exceeded"
+        if authorized_input.token_count != actual_token_count:
+            return "tool_input_token_count_mismatch"
         return None
+
+    @staticmethod
+    def _output_fields_fit(
+        declaration: ToolDeclaration,
+        authorized_input: AuthorizedToolInput,
+        input_digest: str,
+        limits: ToolLimits,
+    ) -> bool:
+        limits_digest = sha256_digest(limits.digest_payload())
+        fixed_fields = (
+            declaration.tool_id,
+            declaration.version,
+            INTERPRETER_VERSION,
+            input_digest,
+            limits_digest,
+            authorized_input.path,
+            authorized_input.scope,
+        )
+        rule_fields = tuple(
+            field
+            for rule in declaration.rules
+            for field in (
+                rule.rule_id,
+                rule.op,
+                rule.message,
+                sha256_digest(dict(rule.params)),
+            )
+        )
+        return all(
+            len(field) <= limits.max_field_length
+            for field in (*fixed_fields, *rule_fields)
+        )
 
     @staticmethod
     def _result(

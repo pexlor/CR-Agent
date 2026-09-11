@@ -20,6 +20,7 @@ from code_review_agent.ports.tools import (
 )
 
 INTERPRETER_CONTRACT_MAJOR = 1
+MAX_VERSION_LENGTH = 64
 TOOL_SCHEMA_DIGEST_V1 = sha256_digest(
     {"contract_version": "1.0", "rule_format_version": 1}
 )
@@ -90,6 +91,10 @@ class ToolRegistryFrozen(ToolRegistryError):
     pass
 
 
+class ToolVersionDisabled(ToolRegistryError):
+    pass
+
+
 def _is_stable_id(value: str) -> bool:
     parts = value.split("-")
     return bool(parts) and all(
@@ -102,6 +107,8 @@ def _is_stable_id(value: str) -> bool:
 
 
 def _numeric_version_parts(value: str, *, count: int) -> tuple[int, ...] | None:
+    if len(value) > MAX_VERSION_LENGTH:
+        return None
     parts = value.split(".")
     if len(parts) != count:
         return None
@@ -315,6 +322,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[tuple[str, str], ToolDeclaration] = {}
+        self._disabled: dict[tuple[str, str], str] = {}
         self._snapshot: ToolRegistrySnapshot | None = None
 
     @classmethod
@@ -344,7 +352,12 @@ class ToolRegistry:
         if not isinstance(raw_tools, list) or not raw_tools:
             raise ToolManifestError("tool_manifest_invalid_tools")
 
-        parsed = tuple(_parse_tool(tool) for tool in raw_tools)
+        try:
+            parsed = tuple(_parse_tool(tool) for tool in raw_tools)
+        except ToolRegistryError:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ToolManifestError("tool_manifest_invalid_field") from error
         keys = tuple((tool.tool_id, tool.version) for tool in parsed)
         if len(set(keys)) != len(keys) or any(key in self._tools for key in keys):
             raise ToolRegistryConflict("tool_registry_identity_conflict")
@@ -352,7 +365,9 @@ class ToolRegistry:
         return parsed
 
     def catalog(self) -> tuple[ToolDeclaration, ...]:
-        return tuple(self._tools[key] for key in sorted(self._tools))
+        return tuple(
+            self._tools[key] for key in sorted(self._tools) if key not in self._disabled
+        )
 
     def freeze(self) -> ToolRegistrySnapshot:
         if self._snapshot is None:
@@ -362,12 +377,19 @@ class ToolRegistry:
         return self._snapshot
 
     def resolve_exact(self, tool_id: str, version: str) -> ToolDeclaration:
+        key = (tool_id, version)
         try:
-            return self._tools[(tool_id, version)]
+            declaration = self._tools[key]
         except KeyError as error:
             raise ToolManifestError(
                 "tool_not_registered", details={"tool_id": tool_id, "version": version}
             ) from error
+        if key in self._disabled:
+            raise ToolVersionDisabled(
+                "tool_version_disabled",
+                details={"tool_id": tool_id, "version": version},
+            )
+        return declaration
 
     def verify_fixed_reference(self, reference: FixedToolReference) -> ToolDeclaration:
         declaration = self.resolve_exact(reference.tool_id, reference.version)
@@ -377,3 +399,15 @@ class ToolRegistry:
                 details={"tool_id": reference.tool_id, "version": reference.version},
             )
         return declaration
+
+    def disable_version(self, reference: FixedToolReference, *, reason: str) -> None:
+        key = (reference.tool_id, reference.version)
+        declaration = self._tools.get(key)
+        if declaration is None or declaration.fixed_reference() != reference:
+            raise ToolManifestError(
+                "tool_reference_mismatch",
+                details={"tool_id": reference.tool_id, "version": reference.version},
+            )
+        if reason != "determinism_violation":
+            raise ToolManifestError("tool_disable_reason_invalid")
+        self._disabled[key] = reason
