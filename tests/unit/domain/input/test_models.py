@@ -28,6 +28,7 @@ def test_input_limits_are_the_frozen_product_limits() -> None:
     assert limits.max_bytes == 1_048_576
     assert limits.max_files == 200
     assert limits.max_changed_lines == 10_000
+    assert limits.max_physical_lines == 20_000
     with pytest.raises(ValueError):
         InputLimits(max_files=0)
 

@@ -19,6 +19,7 @@ from code_review_agent.domain.input.models import (
     InputLimits,
     LineType,
     NormalizedInput,
+    derive_change_set_digest,
 )
 from code_review_agent.domain.input.service import InputService
 from code_review_agent.domain.security.models import (
@@ -29,6 +30,7 @@ from code_review_agent.domain.security.models import (
     SecurityDecision,
     SecurityFinding,
     SensitiveCategory,
+    ArtifactSource,
 )
 from code_review_agent.domain.security.policy import SecurityPolicy
 from code_review_agent.domain.security.service import SecurityService
@@ -551,6 +553,44 @@ def test_native_space_path_is_preserved() -> None:
     assert changed_file.new_path == "my file.py"
 
 
+def test_native_space_path_containing_b_prefix_is_preserved() -> None:
+    content = (
+        "diff --git a/foo b/bar.py b/foo b/bar.py\n"
+        "--- a/foo b/bar.py\n"
+        "+++ b/foo b/bar.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    changed_file = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=content)
+        .change_set.files[0]
+    )
+
+    assert changed_file.old_path == "foo b/bar.py"
+    assert changed_file.new_path == "foo b/bar.py"
+
+
+def test_space_path_header_parsing_is_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    path = "segment " * 2_000 + "file.py"
+    calls = 0
+    original = input_service_module._normalize_path
+
+    def counting_normalize(value: str, prefix: str | None) -> str:
+        nonlocal calls
+        calls += 1
+        return original(value, prefix)
+
+    monkeypatch.setattr(input_service_module, "_normalize_path", counting_normalize)
+
+    assert input_service_module._parse_diff_header(
+        f"diff --git a/{path} b/{path}"
+    ) == (path, path)
+    assert calls <= 4
+
+
 def test_git_c_style_octal_utf8_path_is_decoded() -> None:
     quoted_old = '"a/\\344\\270\\255\\346\\226\\207.py"'
     quoted_new = '"b/\\344\\270\\255\\346\\226\\207.py"'
@@ -978,6 +1018,103 @@ def test_changed_line_limit_stops_before_hashing_line_10001(
 
     assert captured.value.code == "input_too_large"
     assert digest_calls == 10_000
+
+
+def test_physical_line_limit_stops_before_line_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = " keep\n" * 20_001
+    content = (
+        "diff --git a/large.py b/large.py\n"
+        "--- a/large.py\n"
+        "+++ b/large.py\n"
+        "@@ -1,20001 +1,20001 @@\n"
+        f"{context}"
+    )
+    digest_calls = 0
+
+    def counting_digest(value: bytes) -> str:
+        nonlocal digest_calls
+        digest_calls += 1
+        return sha256_bytes(value)
+
+    monkeypatch.setattr(input_service_module, "sha256_bytes", counting_digest)
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_too_large"
+    assert captured.value.details == {"limit": 20_000, "metric": "physical_lines"}
+    assert digest_calls == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "diff --git a/app.py b/app.py\nindex 1234567..abcdef0 100644\n",
+        "diff --git a/app.py b/app.py\ndissimilarity index 80%\n",
+        (
+            "diff --git a/old.py b/new.py\n"
+            "similarity index 100%\n"
+            "rename from old.py\n"
+            "rename to new.py\n"
+            "--- a/old.py\n"
+            "+++ b/new.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        ),
+    ],
+)
+def test_extended_metadata_requires_consistent_content_facts(content: str) -> None:
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+
+
+@pytest.mark.parametrize(
+    "reference_updates",
+    [
+        {"decision": SecurityDecision.BLOCKED},
+        {"decision": SecurityDecision.INDETERMINATE},
+        {"source": ArtifactSource.MODEL_RESPONSE},
+        {"task_id": "other-task"},
+        {"provenance": ("forged-attestation",)},
+    ],
+)
+def test_change_set_rejects_invalid_security_ref_after_coordinated_rehash(
+    reference_updates: dict[str, object],
+) -> None:
+    change_set = make_service().normalize_plain_diff(task_id="task-1", text="").change_set
+    forged_reference = replace(
+        change_set.sanitized_diff_ref,
+        **cast(Any, reference_updates),
+    )
+    forged_digest = derive_change_set_digest(
+        change_set_id=change_set.change_set_id,
+        schema_version=change_set.schema_version,
+        identity=change_set.identity,
+        files=change_set.files,
+        byte_count=change_set.byte_count,
+        changed_line_count=change_set.changed_line_count,
+        limits=change_set.limits,
+        coverage=change_set.coverage,
+        sanitized_diff_ref=forged_reference,
+        normalization_version=change_set.normalization_version,
+    )
+    forged_proof = replace(
+        change_set.completeness,
+        change_set_digest=forged_digest,
+    )
+
+    with pytest.raises(ValueError):
+        replace(
+            change_set,
+            sanitized_diff_ref=forged_reference,
+            completeness=forged_proof,
+            change_set_digest=forged_digest,
+        )
 
 
 def test_exactly_10000_changed_lines_is_accepted() -> None:
