@@ -803,7 +803,7 @@ async def test_invalid_provider_return_becomes_unknown_and_settles_reservation()
     class InvalidReturnProvider(FakeModelProvider):
         async def send_prepared(
             self, request: PreparedModelRequest
-        ) -> ProviderSendResult:
+        ) -> Any:
             self.discard_prepared(request)
             self.send_calls += 1
             return cast(Any, {"secret": "credential=top-secret"})
