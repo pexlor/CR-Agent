@@ -24,7 +24,7 @@ def test_policy_digest_is_deterministic_and_policy_is_immutable() -> None:
 
     assert policy.policy_digest == same.policy_digest
     with pytest.raises(AttributeError):
-        policy.policy_version = 2
+        policy.policy_version = 2  # type: ignore[misc]
 
 
 def test_policy_rejects_weaker_policy_and_allows_stricter_policy() -> None:

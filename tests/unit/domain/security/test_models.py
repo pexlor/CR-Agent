@@ -24,7 +24,7 @@ def descriptor(**overrides: object) -> ArtifactDescriptor:
         "purpose": ArtifactPurpose.DOMAIN_INGRESS,
     }
     values.update(overrides)
-    return ArtifactDescriptor(**values)
+    return ArtifactDescriptor(**values)  # type: ignore[arg-type]
 
 
 def test_descriptor_and_finding_are_immutable_and_do_not_hold_secret_values() -> None:
@@ -44,7 +44,7 @@ def test_descriptor_and_finding_are_immutable_and_do_not_hold_secret_values() ->
     assert item.summary == "credential pattern detected"
     assert artifact.purpose is ArtifactPurpose.DOMAIN_INGRESS
     with pytest.raises(AttributeError):
-        artifact.kind = ArtifactKind.PROMPT
+        artifact.kind = ArtifactKind.PROMPT  # type: ignore[misc]
 
 
 def test_finding_rejects_invalid_ranges_and_raw_value_fields() -> None:

@@ -11,7 +11,9 @@ from code_review_agent.domain.security.policy import SecurityPolicy
 
 def test_scanner_contract_returns_complete_structured_result() -> None:
     class ContractScanner:
-        def scan(self, content: str, descriptor: ArtifactDescriptor, policy: SecurityPolicy) -> ScanResult:
+        def scan(
+            self, content: str, descriptor: ArtifactDescriptor, policy: SecurityPolicy
+        ) -> ScanResult:
             assert isinstance(content, str)
             assert descriptor.kind is ArtifactKind.DIFF
             assert descriptor.purpose is ArtifactPurpose.DOMAIN_INGRESS
