@@ -66,6 +66,10 @@ def _validate_wire_target(method: str, path: str) -> None:
 
 
 def _validate_origin(origin: str) -> None:
+    if origin != origin.strip() or any(
+        ord(character) <= 0x1F or ord(character) == 0x7F for character in origin
+    ):
+        raise ValueError("model provider origin contains unsafe characters")
     try:
         parsed = urlsplit(origin)
         port = parsed.port
@@ -78,6 +82,7 @@ def _validate_origin(origin: str) -> None:
         and all(_HOST_LABEL.fullmatch(label) for label in hostname.split("."))
     )
     expected_netloc = hostname if port is None else f"{hostname}:{port}"
+    canonical_origin = f"https://{expected_netloc}"
     if (
         parsed.scheme != "https"
         or not hostname_valid
@@ -88,6 +93,7 @@ def _validate_origin(origin: str) -> None:
         or parsed.query
         or parsed.fragment
         or port not in (None, 443)
+        or origin != canonical_origin
     ):
         raise ValueError("model provider origin must be a strict HTTPS origin")
 

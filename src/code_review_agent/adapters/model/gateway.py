@@ -168,8 +168,11 @@ class ModelGateway:
             return self._unknown_outcome(reservation.amount)
         finally:
             self._discard_provider(provider, request)
-        if not isinstance(result, ProviderSendResult):
-            return self._unknown_outcome(reservation.amount)
+        if type(result) is not ProviderSendResult:
+            return self._unknown_outcome(
+                reservation.amount,
+                reported_usage=self._reported_usage_as_untrusted(result),
+            )
         try:
             return self._outcome(
                 result,
@@ -177,7 +180,10 @@ class ModelGateway:
                 usage_mapping_trusted=usage_mapping_trusted,
             )
         except Exception:
-            return self._unknown_outcome(reservation.amount)
+            return self._unknown_outcome(
+                reservation.amount,
+                reported_usage=self._reported_usage_as_untrusted(result),
+            )
 
     def discard_prepared(
         self, provider: ModelGatewayPort, request: PreparedModelRequest
@@ -301,14 +307,46 @@ class ModelGateway:
         return True
 
     @staticmethod
-    def _unknown_outcome(reservation_tokens: int) -> ModelCallOutcome:
+    def _unknown_outcome(
+        reservation_tokens: int,
+        *,
+        reported_usage: ModelUsage | None = None,
+    ) -> ModelCallOutcome:
+        usage = reported_usage or ModelUsage(UsageState.MISSING)
+        accounted_tokens = max(
+            reservation_tokens,
+            usage.reported_total or 0,
+        )
         return ModelCallOutcome(
             state=ModelCallState(ProviderState.UNKNOWN, ResponseState.NOT_AVAILABLE),
             reservation_action=ReservationAction.SETTLE_UNCERTAIN,
-            usage=ModelUsage(UsageState.MISSING),
-            accounted_tokens=reservation_tokens,
+            usage=usage,
+            accounted_tokens=accounted_tokens,
             overage_tokens=0,
             error_code="model_result_unknown",
+        )
+
+    @staticmethod
+    def _reported_usage_as_untrusted(result: object) -> ModelUsage | None:
+        try:
+            usage = result.usage  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        if type(usage) is not ModelUsage:
+            return None
+        input_tokens = usage.input_tokens
+        output_tokens = usage.output_tokens
+        if (
+            type(input_tokens) is not int
+            or type(output_tokens) is not int
+            or input_tokens < 0
+            or output_tokens < 0
+        ):
+            return None
+        return ModelUsage(
+            UsageState.UNTRUSTED,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     @staticmethod
@@ -318,7 +356,7 @@ class ModelGateway:
         *,
         usage_mapping_trusted: bool,
     ) -> ModelCallOutcome:
-        result.__post_init__()
+        ProviderSendResult.__post_init__(result)
         if (
             result.provider_state is ProviderState.FAILED_KNOWN
             and result.request_sent is False
