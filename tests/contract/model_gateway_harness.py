@@ -17,6 +17,7 @@ from code_review_agent.domain.execution.models import (
     PromptEnvelope,
     ProviderState,
     ReservationAction,
+    ResponseState,
     UsageState,
 )
 from code_review_agent.ports.model import ModelGatewayPort
@@ -120,6 +121,12 @@ def _assert_scenario_outcome(
         assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
         assert outcome.accounted_tokens == reserved
         assert outcome.usage.state is UsageState.UNTRUSTED
+    elif scenario is ProviderScenario.SUCCEEDED_MISSING:
+        assert outcome.state.provider_state is ProviderState.SUCCEEDED
+        assert outcome.state.response_state is ResponseState.PENDING
+        assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+        assert outcome.accounted_tokens == reserved
+        assert outcome.usage.state is UsageState.MISSING
     elif scenario is ProviderScenario.FAILED_UNSENT:
         assert outcome.state.provider_state is ProviderState.FAILED_KNOWN
         assert outcome.reservation_action is ReservationAction.RELEASE

@@ -292,6 +292,26 @@ def test_provider_origin_allows_only_default_or_explicit_https_port() -> None:
 
 
 @pytest.mark.parametrize(
+    "origin",
+    (
+        " https://model.example.test",
+        "https://model.example.test ",
+        "https://model.example.test\n",
+        "https://model.\texample.test",
+        "https://model.example.test\x00",
+        "https://model.example.test\x1f",
+        "https://model.example.test\x7f",
+        "HTTPS://model.example.test",
+        "https://MODEL.example.test",
+        "https://model.example.test:0443",
+    ),
+)
+def test_provider_origin_must_equal_canonical_control_free_url(origin: str) -> None:
+    with pytest.raises(ValueError, match="origin"):
+        replace(capabilities(), origin=origin)
+
+
+@pytest.mark.parametrize(
     ("field", "invalid_value"),
     tuple(
         (field, invalid_value)
@@ -883,6 +903,55 @@ async def test_mutated_provider_result_becomes_unknown() -> None:
     assert outcome.state.provider_state is ProviderState.UNKNOWN
     assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
     assert outcome.accounted_tokens == reservation.amount
+
+
+@pytest.mark.asyncio
+async def test_mutated_unsent_known_usage_is_conservatively_preserved() -> None:
+    result = ProviderSendResult(
+        provider_state=ProviderState.FAILED_KNOWN,
+        request_sent=True,
+        usage=ModelUsage(UsageState.KNOWN, 300, 250),
+    )
+    object.__setattr__(result, "request_sent", False)
+    provider = FakeModelProvider(capabilities(), (result,))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    reservation = reservation_for(prepared)
+
+    outcome = await gateway.send(provider, prepared, reservation=reservation)
+
+    assert outcome.state.provider_state is ProviderState.UNKNOWN
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.usage.state is UsageState.UNTRUSTED
+    assert outcome.accounted_tokens == 550
+
+
+@pytest.mark.asyncio
+async def test_provider_result_subclass_cannot_override_validation() -> None:
+    class BypassResult(ProviderSendResult):
+        def __post_init__(self) -> None:
+            return None
+
+    result = BypassResult(
+        provider_state=cast(Any, "succeeded"),
+        request_sent=False,
+        usage=ModelUsage(UsageState.KNOWN, 300, 250),
+    )
+    provider = FakeModelProvider(capabilities(), (result,))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    reservation = reservation_for(prepared)
+
+    outcome = await gateway.send(provider, prepared, reservation=reservation)
+
+    assert outcome.state.provider_state is ProviderState.UNKNOWN
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.usage.state is UsageState.UNTRUSTED
+    assert outcome.accounted_tokens == 550
 
 
 @pytest.mark.asyncio
