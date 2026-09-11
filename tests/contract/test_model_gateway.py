@@ -14,6 +14,7 @@ from code_review_agent.domain.execution.models import (
     ModelCapabilities,
     ModelRequestOptions,
     ModelUsage,
+    PreparedModelRequest,
     PromptEnvelope,
     ProviderSendResult,
     ProviderState,
@@ -391,24 +392,22 @@ async def test_gateway_recomputes_body_digest_before_send() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("field", "changed_value"),
-    (
-        ("context_token_limit", 20_000),
-        ("preflight_token_counting", False),
-        ("usage_mapping_trusted", False),
-    ),
+    "field",
+    ("context_token_limit", "preflight_token_counting", "usage_mapping_trusted"),
 )
-async def test_gateway_rejects_capability_drift_after_prepare(
-    field: str, changed_value: object
-) -> None:
+async def test_gateway_rejects_capability_drift_after_prepare(field: str) -> None:
     provider = successful_provider(ModelUsage(UsageState.KNOWN, 100, 50))
     gateway = ModelGateway()
     prepared = gateway.prepare(
         provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
     )
-    provider._capabilities = replace(  # noqa: SLF001 - adversarial contract test
-        provider.capabilities, **{field: changed_value}
-    )
+    if field == "context_token_limit":
+        drifted = replace(provider.capabilities, context_token_limit=20_000)
+    elif field == "preflight_token_counting":
+        drifted = replace(provider.capabilities, preflight_token_counting=False)
+    else:
+        drifted = replace(provider.capabilities, usage_mapping_trusted=False)
+    provider._capabilities = drifted
 
     with pytest.raises(StableError) as caught:
         await gateway.send(provider, prepared, reservation_tokens=500)
@@ -420,11 +419,11 @@ async def test_gateway_rejects_capability_drift_after_prepare(
 @pytest.mark.asyncio
 async def test_usage_trust_is_bound_to_prepare_capability_during_send() -> None:
     class TrustSwitchingProvider(FakeModelProvider):
-        async def send_prepared(self, request: object) -> ProviderSendResult:
-            self._capabilities = replace(
-                self.capabilities, usage_mapping_trusted=True
-            )
-            return await super().send_prepared(request)  # type: ignore[arg-type]
+        async def send_prepared(
+            self, request: PreparedModelRequest
+        ) -> ProviderSendResult:
+            self._capabilities = replace(self.capabilities, usage_mapping_trusted=True)
+            return await super().send_prepared(request)
 
     provider = TrustSwitchingProvider(
         replace(capabilities(), usage_mapping_trusted=False),
