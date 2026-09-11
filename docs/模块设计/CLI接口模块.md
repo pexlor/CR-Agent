@@ -18,13 +18,14 @@ stdout 仅输出最终结果，进度/警告/错误写 stderr。`--json` 时 std
 review / resume TASK_ID / status TASK_ID / trace show TRACE_ID
 credentials set|clear|status / providers list
 terminate TASK_ID / cleanup TASK_ID
+maintenance backups list|delete BACKUP_ID
 ```
 
-通用选项为 `--json`、`--no-color`、`--verbose`、`--request-id UUID` 和 `--help`。verbose 仅增加已脱敏摘要。`--request-id` 是可选调用方覆盖标识：提供时作为本次命令对应应用用例的 `request_id`（实现幂等重放），未提供时由 CLI 为每个控制操作分别生成 `request_id`；`CliResponseEnvelope` 始终回显本次实际使用的 request ID，二者关系以"显式覆盖优先、缺省自动生成"为准。当一条命令展开为多个应用用例（如 resume 可能包含 AddBudgetAuthorization + ResumeReview + RetryReportDelivery）时，仅首个用例使用调用方提供的 `--request-id`，其余用例由 CLI 派生独立的新 `request_id` 并在信封中回显各用例的 request ID 映射，避免复用同一覆盖 ID 造成预算模块"授权 request_id 唯一"冲突。
+通用选项为 `--json`、`--no-color`、`--verbose`、`--request-id UUID` 和 `--help`。verbose 仅增加已脱敏摘要。`--request-id` 是整条 CLI 命令的父 request ID；未提供时 CLI 生成一个并在 `CliResponseEnvelope` 回显。要在响应丢失后重放，调用方必须复用该父 ID。当一条命令展开为多个应用用例（如 resume 可能包含 AddBudgetAuthorization + ResumeReview + RetryReportDelivery）时，每个子操作 ID 都通过固定 namespace 的 UUIDv5 从 `(parent_request_id, command_schema_version, operation_name)` 确定性派生，绝不随机重生或直接复用父 ID。应用层保存父命令步骤回执；响应丢失后用相同父 ID 重放时，各步骤返回原结果，已成功步骤不会重复追加预算、取得租约或创建交付尝试。
 
 `CliResponseEnvelope` 包含 schema version、command、request ID、ok、data、error、warnings。错误只含稳定 code/category/message/stage/recoverable/task/trace ID、next actions 和标量 details。
 
-`TaskStatusView` 分别输出 control state、phase、result state、delivery state、availability、recoverability、reason、固定输入、Provider/模型、预算、报告、checkpoint、期限和 next actions。不得把“审查完成、报告失败”折叠成审查失败。
+`TaskStatusView` 分别输出 control state、phase、result state、delivery state、最新 stop revision/action/state、availability、recoverability、reason、固定输入、Provider/模型、预算、报告、checkpoint、期限和 next actions。不得把“审查完成、报告失败”折叠成审查失败。
 
 ## 4. review 与 resume
 
@@ -37,7 +38,7 @@ resume TASK_ID [--add-budget-tokens N] [--confirm-unknown-retry]
 
 review 三种输入恰好一个；未指定且 stdin 非 TTY 时等价于 `--stdin`，TTY 不等待隐式输入。CLI 只构造来源 DTO；UTF-8、diff、规模、完整性和路径安全由输入用例处理。URL 语法层只接受 HTTPS GitHub.com PR/GitLab.com MR，拒绝 userinfo/query/fragment。预算默认 50000，语法范围 1..1000000。MVP 不接受自定义输出路径，报告位置始终由应用层按 task ID 派生为 `reports/<task_id>.md`，成功响应返回该规范化位置。
 
-追加预算和 resume 是两个显式应用操作：先幂等追加，再恢复。每个控制操作分别生成 `request_id` 和请求指纹，并携带调用前取得的 `expected_task_version` 与类型化本机可信用户操作凭据；版本冲突后重新读取状态，不复用旧版本盲重试。unknown 未确认时不调用外部系统；确认也不能绕过新预留。固定条件变化返回 `new_task_required`。severity 为内部字段，MVP CLI/Markdown 不展示标签。
+追加预算和 resume 是两个显式应用操作：先幂等追加，再恢复。两者使用父命令确定性派生的不同子 request ID 和各自请求指纹，并携带调用前取得的 `expected_task_version` 与类型化本机可信用户操作凭据；父命令步骤回执记录每步使用的任务版本与结果。版本冲突后重新读取状态，不复用旧版本盲重试。unknown 未确认时不调用外部系统；确认也不能绕过新预留。固定条件变化返回 `new_task_required`。severity 为内部字段，MVP CLI/Markdown 不展示标签。
 
 ## 5. 查询、凭据、终止和清理
 
@@ -47,7 +48,9 @@ review 三种输入恰好一个；未指定且 stdin 非 TTY 时等价于 `--std
 
 credentials set 默认隐藏 TTY 输入，非交互必须 `--token-stdin`；clear 非交互要求 `--yes`；status 只显示 configured 状态，不显示掩码、长度或前后缀。providers list 只读取 Registry catalog 和凭证存在性，不网络探测。
 
-terminate 使用稳定 reason code，是协作式控制，不跨进程强杀、不删除数据、不清零预算、不把 partial 标完整。cleanup 在 TTY 确认，非交互要求 `--yes`；资格与原子删除由应用层判断，保留 Markdown 和墓碑，失败时详细数据完整保留。resume、预算追加、terminate、报告重试和 cleanup 统一映射 `ControlCommand` 元数据：`task_id`、`expected_task_version`、类型化可信用户操作凭据、`request_id` 和安全请求指纹；具体命令字段另行附加。其中"报告重试"没有独立 CLI 命令，由 `resume TASK_ID` 按任务状态路由：任务审查已完成或已终止、报告交付为 `pending/failed/unknown` 时，resume 隐式触发 `RetryReportDelivery` 并标注为报告重试；任务处于 `paused`（含 `budget_anomaly` 冻结）且已有可交付快照、交付状态为 `pending/failed/unknown` 时，resume 在完成恢复校验后也允许路由到报告重试（与任务模块"冻结期间允许报告交付"一致）；不单独暴露 `retry-report` 命令。
+terminate 使用 `requested_action=terminate` 写入独立 stop revision；SIGINT/SIGTERM 的 RequestPause 使用 `requested_action=pause`。两者不修改 Task.version、不跨进程强杀、不夺取有效租约。命令成功表示请求已可靠落盘；最终 paused/terminated 状态通过 status 查询。cleanup 在 TTY 确认，非交互要求 `--yes`；资格与原子删除由应用层判断，保留 Markdown、墓碑和任务保留组外的最小命令回执，失败时详细数据完整保留。resume、预算追加、报告重试和 cleanup 使用 expected_task_version；pause/terminate 创建使用观察到的任务版本作审计字段和独立 stop_revision，不以 Task 条件更新制造执行者版本冲突。
+
+`maintenance backups list` 只显示安全备份 ID、schema 版本、创建/到期时间和状态。`maintenance backups delete BACKUP_ID` 是显式、幂等的本机维护操作，TTY 要求确认，非交互要求 `--yes`；它只能删除 sidecar manifest 中由应用创建且摘要/所有者匹配的备份。文件删除与 SQLite 控制命令回执不能组成单一事务，因此采用 `deleting → 文件删除/目录同步 → deleted` 的可核对状态机；响应丢失后通过相同 request ID 查询 manifest 和回执，只补记缺失事实，不重复错误删除。删除失败不得解除 `cleanup_blocked_by_backup`。
 
 ## 6. 输出、信号与退出码
 
@@ -72,8 +75,8 @@ terminate 使用稳定 reason code，是协作式控制，不跨进程强杀、�
 
 ## 7. 用例映射、测试与 ADR
 
-review→StartReview；resume→可选 AddBudgetAuthorization + ResumeReview（任务处于暂停或已终止、报告待重试时隐式触发 RetryReportDelivery）；status→GetTaskStatus；trace→GetCommentTrace；credentials→CredentialApplicationService；providers→ListProviderCatalog；terminate→TerminateReview；cleanup→CleanupTask。CLI 不补查 repository 或解析错误文本。
+review→StartReview；resume→可选 AddBudgetAuthorization + ResumeReview（任务处于暂停或已终止、报告待重试时隐式触发 RetryReportDelivery）；status→GetTaskStatus；trace→GetCommentTrace；credentials→CredentialApplicationService；providers→ListProviderCatalog；terminate→TerminateReview；信号→RequestPause；无有效租约的待处理请求→AcquireStopConvergence；cleanup→CleanupTask；maintenance backups→BackupMaintenanceService。复合命令测试必须覆盖每个步骤后响应丢失及父 ID 重放。CLI 不补查 repository 或解析错误文本。
 
 测试参数互斥、stdin/TTY、URL/预算边界、DTO 映射、stdout/stderr、JSON golden、Rich 快照、退出码、凭证不回显、确认和信号；架构测试禁止 CLI 导入 repository、SDK、keyring 和领域实现。
 
-ADR-CLI-001：human/JSON 共享 DTO。ADR-CLI-002：退出码按稳定类别分配。ADR-CLI-003：信号映射为协作式暂停。
+ADR-CLI-001：human/JSON 共享 DTO。ADR-CLI-002：退出码按稳定类别分配。ADR-CLI-003：信号和 terminate 映射为持久化协作式停止请求。ADR-CLI-004：复合命令子 ID 从父 request ID 确定性派生。

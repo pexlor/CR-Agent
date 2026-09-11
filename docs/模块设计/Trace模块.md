@@ -110,6 +110,8 @@ Trace 模块拥有事件信封、任务内序号、事件边、逐评论 `TraceL
 ```text
 task.created
 task.execution_started
+task.stop_requested
+task.stop_observed
 task.paused
 task.resume_started
 task.resumed
@@ -133,7 +135,8 @@ tool.attempt_prepared
 tool.attempt_started
 tool.attempt_succeeded
 tool.attempt_failed
-tool.attempt_unknown
+tool.attempt_blocked
+tool.attempt_interrupted
 
 model.call_reserved
 model.call_started
@@ -188,7 +191,11 @@ trace.link_corrected
 | 事件 | 必填权威引用 | 必需前驱或条件 | 禁止情况 |
 | --- | --- | --- | --- |
 | `tool.attempt_started` | 已提交的 `tool_call_id`、attempt、工具声明版本 | `tool.attempt_prepared` | 工具未获计划授权 |
-| `tool.attempt_succeeded` | 状态为 succeeded 的工具调用、安全结果引用 | `tool.attempt_started` | 失败、unknown 或结果未通过安全/schema 校验 |
+| `tool.attempt_succeeded` | 状态为 succeeded 的工具调用、安全结果引用 | `tool.attempt_started` | 失败、中断、阻断或结果未通过安全/schema 校验 |
+| `tool.attempt_blocked` | 状态为 blocked 的工具调用、稳定阻断原因 | `tool.attempt_prepared` | 声称工具已开始或产生验证结果 |
+| `tool.attempt_interrupted` | 状态为 interrupted 的工具调用、中断边界 | `tool.attempt_started` | 把本地确定性中断表达为外部结果 unknown |
+| `task.stop_requested` | 已提交 StopRequest、action、stop revision、控制命令回执 | 任务未清理且 action 合法 | 修改 Task.version、夺取有效审查租约或伪造最终状态 |
+| `task.stop_observed` | StopRequest、action/revision、当前 review_execution 或 stop_convergence 租约和 fencing | 执行者在安全边界观察请求 | 观察后又开始新外部 I/O |
 | `model.call_reserved` | `model_call_id`、reservation、prepared request 摘要 | 调用准备事务 | 无预算预留或请求摘要不一致 |
 | `model.call_started` | 状态为 running 的模型调用 | `model.call_reserved` | 外部 I/O 尚未获准 |
 | `model.call_succeeded` | Provider 状态为 succeeded 的调用、usage 结算引用 | `model.call_started` | Provider 调用 unknown；响应业务处理结果由独立事件表达 |
@@ -240,7 +247,7 @@ trace_report_summary
 
 模型 Trace 保存实际发送请求的安全引用和字节摘要、Provider/模型、输出模式、最大输出 token、经过结构化解析与白名单字段投影的响应引用、白名单 usage 和真实终态。不得把供应商普通 `content` 整段作为 Trace payload：只有契约定义的结构化字段可以持久化，疑似 reasoning、chain-of-thought、过程独白及无法分类的自由文本一律丢弃。模型产生的候选陈述必须标记为 `model_claim`，不能直接使用 `observation` 或 `validated_by`；只有权威业务状态或确定性证据核对后，才能由对应领域模块产生事实或验证事件。
 
-工具事件必须区分计划、实际开始、成功、失败、unknown、安全/schema 校验及是否被评论采用。未运行不得创建 started/succeeded；失败不得创建“验证通过”事实。
+工具事件必须区分计划、实际开始、成功、失败、blocked、interrupted、安全/schema 校验及是否被评论采用。本地确定性工具没有 unknown 终态；未运行不得创建 started/succeeded，失败、阻断或中断不得创建“验证通过”事实。
 
 ## 9. 因果与关联模型
 
@@ -343,7 +350,7 @@ verify_integrity(task_id)
   -> TraceIntegrityResult
 ```
 
-`TraceMutationIntent` 至少携带稳定 Intent ID、任务 ID、事件/边/链接、预期任务版本、业务事务类型、幂等键和安全摘要。执行面事务还必须携带有效租约与 fencing token；任务创建、预算追加、显式恢复前置控制、清理等本机可信用户控制面事务不要求执行租约，但必须携带类型化用户操作凭据，并在同一事务证明当前无有效租约。相同键相同摘要重放返回原结果；相同键不同摘要返回冲突。
+`TraceMutationIntent` 至少携带稳定 Intent ID、任务 ID、事件/边/链接、业务事务类型、幂等键和安全摘要；普通任务事件还携带预期 Task.version。执行面事务必须携带有效租约与 fencing token。StopRequest 创建是独立控制流，只携带 `stop_revision`、观察到的任务版本和类型化可信用户操作，不条件更新 Task 行；它允许在有效审查租约存在时写入 `task.stop_requested`，但不能携带或取代执行者 fencing token，也不能写 stop_observed/paused/terminated。相同键相同摘要重放返回原结果；同键不同摘要返回冲突。
 
 ## 13. 原子事务
 
@@ -359,6 +366,7 @@ Trace 模块不自行提交跨模块事务。
 - **评论形成**：FinalFinding、置信度事实和 `TraceLink` 共同提交；FinalFinding 本身即最终评论；
 - **报告交付**：交付状态、产物摘要和报告 Trace 共同提交；
 - **清理**：删除完整 Trace 及全部任务详细数据并写墓碑，全有或全无。
+- **停止请求**：控制面原子提交包含 action/stop_revision 的 StopRequest、控制命令回执和 task.stop_requested，不更新 Task.version；执行者随后以 review_execution 或 stop_convergence 租约提交 task.stop_observed，最终按 action 与快照、task.paused 或 task.terminated、请求完成状态和租约释放共同提交。
 
 清理完成不写入将被同一事务删除的 Trace 事件；结果仅保存在任务墓碑和独立的白名单安全运维记录中。
 
@@ -393,7 +401,7 @@ Trace 模块不自行提交跨模块事务。
 - `(task_id, sequence)`、`event_id`、任务内 `idempotency_key` 唯一；
 - 同一 FinalFinding 的同一 `link_version` 唯一，当前有效链接最多一个；
 - 事务内事件按确定规则分配连续序号；
-- 执行面写入携带任务版本、租约 ID 和 fencing token；控制面写入携带预期任务版本、类型化用户操作凭据和“无有效租约”条件；
+- 执行面写入携带任务版本、租约 ID 和 fencing token；普通控制面写入携带预期任务版本并证明无有效租约；StopRequest 创建只携带独立 stop_revision 和可信操作，可与有效审查租约并存，不更新 Task.version 或推进执行状态；
 - 旧执行者不能追加迟到事件、边或链接；
 - 同一 Intent 重放不重新分配序号；
 - Trace 查询可并发，但不能看到未提交的部分事务集合。
