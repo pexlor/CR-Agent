@@ -177,6 +177,15 @@ class ModelUsage:
         return self.input_tokens + self.output_tokens
 
 
+def _validate_exact_usage(usage: object, owner: str) -> None:
+    if type(usage) is not ModelUsage:
+        raise TypeError(f"{owner} usage must be an exact ModelUsage")
+    try:
+        ModelUsage.__post_init__(usage)
+    except (TypeError, ValueError):
+        raise TypeError(f"{owner} usage is invalid") from None
+
+
 @dataclass(frozen=True, slots=True)
 class ModelCapabilities:
     provider_id: str
@@ -358,8 +367,7 @@ class ProviderSendResult:
             raise TypeError("provider result state must be a ProviderState")
         if self.request_sent is not None and type(self.request_sent) is not bool:
             raise TypeError("request_sent must be a bool or None")
-        if not isinstance(self.usage, ModelUsage):
-            raise TypeError("provider usage must be ModelUsage")
+        _validate_exact_usage(self.usage, "provider")
         if self.provider_state not in {
             ProviderState.SUCCEEDED,
             ProviderState.FAILED_KNOWN,
@@ -409,8 +417,7 @@ class ModelCallOutcome:
             raise TypeError("model outcome state must be ModelCallState")
         if type(self.reservation_action) is not ReservationAction:
             raise TypeError("reservation action must be ReservationAction")
-        if not isinstance(self.usage, ModelUsage):
-            raise TypeError("model outcome usage must be ModelUsage")
+        _validate_exact_usage(self.usage, "model outcome")
         if (
             type(self.accounted_tokens) is not int
             or type(self.overage_tokens) is not int
