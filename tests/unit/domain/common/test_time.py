@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -6,7 +6,7 @@ from code_review_agent.domain.common.time import FixedClock, SystemClock, ensure
 
 
 def test_ensure_utc_accepts_aware_utc_and_rejects_naive_or_non_utc() -> None:
-    value = datetime(2026, 9, 11, 1, 2, 3, tzinfo=timezone.utc)
+    value = datetime(2026, 9, 11, 1, 2, 3, tzinfo=UTC)
 
     assert ensure_utc(value) is value
     with pytest.raises(ValueError):
@@ -16,7 +16,7 @@ def test_ensure_utc_accepts_aware_utc_and_rejects_naive_or_non_utc() -> None:
 
 
 def test_clocks_return_utc_values() -> None:
-    fixed = FixedClock(datetime(2026, 9, 11, tzinfo=timezone.utc))
+    fixed = FixedClock(datetime(2026, 9, 11, tzinfo=UTC))
 
-    assert fixed.now().tzinfo == timezone.utc
-    assert SystemClock().now().tzinfo == timezone.utc
+    assert fixed.now().tzinfo == UTC
+    assert SystemClock().now().tzinfo == UTC

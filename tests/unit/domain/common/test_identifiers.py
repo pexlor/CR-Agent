@@ -24,4 +24,4 @@ def test_identifier_rejects_noncanonical_or_non_v4_values() -> None:
 def test_different_identifier_types_do_not_compare_equal() -> None:
     value = "123e4567-e89b-42d3-a456-426614174000"
 
-    assert TaskId.parse(value) != CheckpointId.parse(value)
+    assert TaskId.parse(value) != CheckpointId.parse(value)  # type: ignore[comparison-overlap]

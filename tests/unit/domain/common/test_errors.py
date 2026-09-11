@@ -31,7 +31,7 @@ def test_stable_error_rejects_exception_objects_and_nested_details() -> None:
             category="internal",
             stage="execution",
             recoverable=False,
-            details={"cause": RuntimeError("secret response body")},
+            details={"cause": RuntimeError("secret response body")},  # type: ignore[dict-item]
         )
     with pytest.raises(TypeError):
         StableError(
@@ -39,7 +39,7 @@ def test_stable_error_rejects_exception_objects_and_nested_details() -> None:
             category="internal",
             stage="execution",
             recoverable=False,
-            details={"nested": {"body": "secret"}},
+            details={"nested": {"body": "secret"}},  # type: ignore[dict-item]
         )
 
 
@@ -61,4 +61,8 @@ def test_stable_error_rejects_invalid_codes_and_mutation() -> None:
         details=details,
     )
     details["leak"] = "must not appear"
-    assert "leak" not in error.to_dict()["details"]
+    details_snapshot = error.to_dict()["details"]
+    assert isinstance(details_snapshot, dict)
+    assert "leak" not in details_snapshot
+    with pytest.raises(AttributeError):
+        error.code = "changed"
