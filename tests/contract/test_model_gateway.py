@@ -190,6 +190,49 @@ def test_incompatible_provider_safety_capability_is_rejected() -> None:
         )
 
 
+def test_provider_without_preflight_token_counting_is_rejected() -> None:
+    provider = FakeModelProvider(
+        replace(capabilities(), preflight_token_counting=False)
+    )
+
+    with pytest.raises(StableError, match="model_capability_mismatch"):
+        ModelGateway().prepare(
+            provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+        )
+
+    assert provider.prepare_calls == 0
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    (
+        "authorization",
+        "cookie",
+        "x-auth-token",
+        "x-amz-security-token",
+        "x-arbitrary-header",
+    ),
+)
+def test_model_headers_use_an_explicit_non_authentication_allowlist(
+    header_name: str,
+) -> None:
+    with pytest.raises(ValueError, match="allowlist"):
+        replace(capabilities(), fixed_headers={header_name: "secret-or-user-input"})
+
+
+def test_fixed_protocol_header_is_allowed() -> None:
+    value = replace(
+        capabilities(),
+        fixed_headers={
+            "accept": "application/json",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+
+    assert value.fixed_headers["anthropic-version"] == "2023-06-01"
+
+
 @pytest.mark.asyncio
 async def test_failure_before_request_is_sent_releases_reservation() -> None:
     provider = FakeModelProvider(
@@ -328,6 +371,82 @@ async def test_gateway_revalidates_fixed_request_before_send(
 
     assert caught.value.code == "model_capability_mismatch"
     assert provider.send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_recomputes_body_digest_before_send() -> None:
+    provider = successful_provider(ModelUsage(UsageState.KNOWN, 100, 50))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    object.__setattr__(prepared, "body", b'{"tampered":true}')
+
+    with pytest.raises(StableError) as caught:
+        await gateway.send(provider, prepared, reservation_tokens=500)
+
+    assert caught.value.code == "model_capability_mismatch"
+    assert provider.send_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    (
+        ("context_token_limit", 20_000),
+        ("preflight_token_counting", False),
+        ("usage_mapping_trusted", False),
+    ),
+)
+async def test_gateway_rejects_capability_drift_after_prepare(
+    field: str, changed_value: object
+) -> None:
+    provider = successful_provider(ModelUsage(UsageState.KNOWN, 100, 50))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    provider._capabilities = replace(  # noqa: SLF001 - adversarial contract test
+        provider.capabilities, **{field: changed_value}
+    )
+
+    with pytest.raises(StableError) as caught:
+        await gateway.send(provider, prepared, reservation_tokens=500)
+
+    assert caught.value.code == "model_capability_mismatch"
+    assert provider.send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_usage_trust_is_bound_to_prepare_capability_during_send() -> None:
+    class TrustSwitchingProvider(FakeModelProvider):
+        async def send_prepared(self, request: object) -> ProviderSendResult:
+            self._capabilities = replace(
+                self.capabilities, usage_mapping_trusted=True
+            )
+            return await super().send_prepared(request)  # type: ignore[arg-type]
+
+    provider = TrustSwitchingProvider(
+        replace(capabilities(), usage_mapping_trusted=False),
+        (
+            ProviderSendResult(
+                provider_state=ProviderState.SUCCEEDED,
+                request_sent=True,
+                response_payload={"findings": []},
+                usage=ModelUsage(UsageState.KNOWN, 300, 250),
+            ),
+        ),
+    )
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    outcome = await gateway.send(provider, prepared, reservation_tokens=500)
+
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.usage.state is UsageState.UNTRUSTED
+    assert outcome.accounted_tokens == 550
 
 
 @pytest.mark.asyncio
