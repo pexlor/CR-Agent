@@ -1,0 +1,52 @@
+# Code Review Report
+
+Task: {{ task_id }}
+Snapshot: {{ snapshot_id }} (v{{ snapshot_version }})
+
+## Conclusion
+
+{{ completion.conclusion }}
+
+State: `{{ completion.state }}`
+{% for limitation in completion.limitations %}
+Limitation: {{ limitation }}
+{% endfor %}
+
+## Subject
+
+{{ subject }}
+
+## Coverage
+
+{% for item in coverage %}
+- `{{ item.scope_id }}`: `{{ item.state }}` ({{ item.reason_code }})
+{% else %}
+- Not applicable.
+{% endfor %}
+
+## Findings
+
+{% for finding in findings %}
+### {{ finding.title }}
+
+- ID: `{{ finding.finding_id }}`
+- Location: `{{ finding.location.kind.value }} `{{ finding.location.file_id }}`{% if finding.location.line %}:{{ finding.location.line }}{% endif %}
+- Severity: `{{ finding.severity }}`
+- Confidence: `{{ finding.confidence.value }}`
+- Problem: {{ finding.problem }}
+- Trigger: {{ finding.trigger_condition }}
+- Impact: {{ finding.impact }}
+- Suggestion: {{ finding.suggestion }}
+- Confidence basis: {{ finding.confidence_basis }}
+- Trace: `{{ finding.trace_id }}`
+{% else %}
+未发现有效问题。
+{% endfor %}
+
+## Budget
+
+{{ budget }}
+
+## Trace
+
+{{ trace }}

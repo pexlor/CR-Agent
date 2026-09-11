@@ -1,0 +1,1 @@
+"""Local output adapters."""

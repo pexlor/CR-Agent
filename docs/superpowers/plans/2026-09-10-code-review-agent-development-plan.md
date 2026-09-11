@@ -560,11 +560,11 @@ git commit -m "feat: validate and consolidate findings"
 - 创建：`src/code_review_agent/domain/report/builder.py`
 - 创建：`tests/unit/domain/report/test_builder.py`
 
-- [ ] 测试 no_changes、complete_no_findings、complete_with_findings、partial、failed、unknown 六种状态。
-- [ ] 测试快照固定 InputBinding、ReviewPlan、CoverageSnapshot、FindingSet、BudgetSummary、UnknownAttemptSet 和 TraceSummary。
-- [ ] 测试引用缺失、跨任务、摘要不符和 schema 不支持时失败。
-- [ ] 测试 CandidateFinding 不能进入 ReportModel。
-- [ ] 测试“未发现有效问题”不被表述为不存在缺陷。
+- [x] 测试 no_changes、complete_no_findings、complete_with_findings、partial、failed、unknown 六种状态。
+- [x] 测试快照固定 InputBinding、ReviewPlan、CoverageSnapshot、FindingSet、BudgetSummary、UnknownAttemptSet 和 TraceSummary。
+- [x] 测试引用缺失、跨任务、摘要不符和 schema 不支持时失败。
+- [x] 测试 CandidateFinding 不能进入 ReportModel。
+- [x] 测试“未发现有效问题”不被表述为不存在缺陷。
 - [ ] 提交：
 
 ```bash
@@ -581,12 +581,12 @@ git commit -m "feat: build report model from snapshots"
 - 创建：`tests/golden/review/`
 - 创建：`tests/integration/test_markdown_delivery.py`
 
-- [ ] 为六种结果状态建立 golden tests。
-- [ ] 测试模板只展示字段，不重新计算状态、预算、排序或置信度。
-- [ ] 测试完整 UTF-8 字节安全复扫后才允许写入。
-- [ ] 测试临时文件、文件 `fsync`、`os.replace`、父目录 `fsync` 和摘要核对。
-- [ ] 在 replace 前后、数据库终态提交前注入崩溃，验证 unknown 核对。
-- [ ] 测试不同任务不会覆盖，同任务新快照原子替换固定路径。
+- [x] 为六种结果状态建立 golden tests。
+- [x] 测试模板只展示字段，不重新计算状态、预算、排序或置信度。
+- [x] 测试完整 UTF-8 字节安全复扫后才允许写入。
+- [x] 测试临时文件、文件 `fsync`、`os.replace`、父目录 `fsync` 和摘要核对。
+- [x] 在 replace 前后、数据库终态提交前注入崩溃，验证 unknown 核对。
+- [x] 测试不同任务不会覆盖，同任务新快照原子替换固定路径。
 - [ ] 提交：
 
 ```bash
