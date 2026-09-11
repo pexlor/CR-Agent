@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from code_review_agent.adapters.tools import runtime as runtime_module
 from code_review_agent.adapters.tools.registry import ToolRegistry
 from code_review_agent.adapters.tools.runtime import RestrictedToolRuntime
 from code_review_agent.domain.common.errors import StableError
@@ -164,6 +165,66 @@ def test_runtime_blocks_oversized_authorized_input(
     assert result.state is ToolExecutionState.BLOCKED
     assert result.error_code == error_code
     assert result.evidence == ()
+
+
+def test_byte_limit_rejects_before_input_digest_or_tokenization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, declaration = _runtime()
+    punctuation = "!" * 10_000
+    oversized = AuthorizedToolInput(
+        text=punctuation,
+        path="a.py",
+        scope="hunk:1",
+        token_count=0,
+    )
+    limits = replace(declaration.limits, max_input_bytes=64, max_tokens=64)
+
+    def forbidden_digest(value: AuthorizedToolInput) -> str:
+        del value
+        raise AssertionError("oversized input digest must not be computed")
+
+    def forbidden_tokenization(value: str) -> tuple[object, ...]:
+        del value
+        raise AssertionError("oversized input must not be tokenized")
+
+    monkeypatch.setattr(AuthorizedToolInput, "input_digest", property(forbidden_digest))
+    monkeypatch.setattr(
+        runtime_module, "deterministic_tool_tokens", forbidden_tokenization
+    )
+
+    result = runtime.execute(
+        declaration.fixed_reference(),
+        oversized,
+        limits,
+        ToolExecutionContext(task_id="task-1", execution_id="attempt-1"),
+    )
+
+    assert result.state is ToolExecutionState.BLOCKED
+    assert result.error_code == "tool_input_bytes_exceeded"
+    assert result.evidence == ()
+
+
+def test_large_punctuation_token_count_uses_the_shared_lazy_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    punctuation = "!" * 10_000
+
+    def forbidden_materialization(value: str) -> tuple[object, ...]:
+        del value
+        raise AssertionError("token counting must not materialize a token tuple")
+
+    monkeypatch.setattr(
+        tool_contracts, "deterministic_tool_tokens", forbidden_materialization
+    )
+
+    iterator = tool_contracts.iter_deterministic_tool_tokens(punctuation)
+    first = next(iterator)
+
+    assert first.value == "!"
+    assert tool_contracts.deterministic_tool_token_count(punctuation) == len(
+        punctuation
+    )
 
 
 def test_underreported_token_count_cannot_bypass_the_runtime_limit() -> None:
