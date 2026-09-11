@@ -755,6 +755,42 @@ def test_capability_boundary_exception_is_mapped_without_secret_text() -> None:
     assert "secret" not in repr(caught.value)
 
 
+def test_prepare_boundary_exception_is_mapped_without_secret_text() -> None:
+    class ExplodingPrepareProvider(FakeModelProvider):
+        def prepare_request(
+            self, envelope: PromptEnvelope, options: ModelRequestOptions
+        ) -> PreparedModelRequest:
+            raise RuntimeError("credential=top-secret")
+
+    provider = ExplodingPrepareProvider(capabilities())
+
+    with pytest.raises(StableError) as caught:
+        ModelGateway().prepare(
+            provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+        )
+
+    assert caught.value.code == "model_failed_known"
+    assert "secret" not in repr(caught.value)
+
+
+def test_discard_boundary_exception_is_mapped_without_secret_text() -> None:
+    class ExplodingDiscardProvider(FakeModelProvider):
+        def discard_prepared(self, request: PreparedModelRequest) -> None:
+            raise RuntimeError("credential=top-secret")
+
+    provider = ExplodingDiscardProvider(capabilities())
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    with pytest.raises(StableError) as caught:
+        gateway.discard_prepared(provider, prepared)
+
+    assert caught.value.code == "model_failed_known"
+    assert "secret" not in repr(caught.value)
+
+
 def test_prepare_owns_failure_discards_provider_permit() -> None:
     class BrokenOwnsProvider(FakeModelProvider):
         def owns_prepared_request(self, request: PreparedModelRequest) -> bool:
@@ -927,6 +963,13 @@ def fake_provider_for_scenario(scenario: ProviderScenario) -> ModelGatewayPort:
             provider_state=ProviderState.SUCCEEDED,
             request_sent=True,
             response_payload={"findings": []},
+        )
+    elif scenario is ProviderScenario.SUCCEEDED_UNTRUSTED:
+        result = ProviderSendResult(
+            provider_state=ProviderState.SUCCEEDED,
+            request_sent=True,
+            response_payload={"findings": []},
+            usage=ModelUsage(UsageState.UNTRUSTED, 5, 3),
         )
     elif scenario is ProviderScenario.FAILED_UNSENT:
         result = ProviderSendResult(

@@ -29,6 +29,7 @@ _FIXED_HEADER_ALLOWLIST = frozenset(
 class ProviderScenario(StrEnum):
     SUCCEEDED_KNOWN = "succeeded_known"
     SUCCEEDED_MISSING = "succeeded_missing"
+    SUCCEEDED_UNTRUSTED = "succeeded_untrusted"
     FAILED_UNSENT = "failed_unsent"
     UNKNOWN = "unknown"
     EXCEPTION = "exception"
@@ -114,6 +115,11 @@ def _assert_scenario_outcome(
         assert outcome.state.provider_state is ProviderState.SUCCEEDED
         assert outcome.reservation_action is ReservationAction.SETTLE_KNOWN
         assert outcome.accounted_tokens == 8
+    elif scenario is ProviderScenario.SUCCEEDED_UNTRUSTED:
+        assert outcome.state.provider_state is ProviderState.SUCCEEDED
+        assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+        assert outcome.accounted_tokens == reserved
+        assert outcome.usage.state is UsageState.UNTRUSTED
     elif scenario is ProviderScenario.FAILED_UNSENT:
         assert outcome.state.provider_state is ProviderState.FAILED_KNOWN
         assert outcome.reservation_action is ReservationAction.RELEASE
