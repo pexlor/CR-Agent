@@ -21,6 +21,7 @@ from code_review_agent.ports.tools import (
 
 INTERPRETER_CONTRACT_MAJOR = 1
 MAX_VERSION_LENGTH = 64
+MAX_TOOL_ID_LENGTH = 64
 TOOL_SCHEMA_DIGEST_V1 = sha256_digest(
     {"contract_version": "1.0", "rule_format_version": 1}
 )
@@ -238,7 +239,7 @@ def _parse_tool(value: Any) -> ToolDeclaration:
         raise ToolManifestError("tool_manifest_invalid_tool")
     _require_exact_fields(value, _TOOL_FIELDS, location="tool")
     limits = _parse_limits(value["limits"])
-    tool_id = _require_string(value["id"], field="id")
+    tool_id = _require_string(value["id"], field="id", max_length=MAX_TOOL_ID_LENGTH)
     version = _require_string(value["version"], field="version")
     contract_version = _require_string(
         value["contract_version"], field="contract_version"

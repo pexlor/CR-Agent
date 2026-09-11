@@ -10,6 +10,7 @@ from typing import Protocol
 from code_review_agent.domain.common.digests import sha256_digest
 
 type RuleParameter = str | int | tuple[str, ...]
+SHA256_HEX_LENGTH = 64
 
 
 def deterministic_tool_token_count(text: str) -> int:
@@ -58,6 +59,8 @@ class ToolLimits:
             value = getattr(self, field_name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{field_name} must be a positive integer")
+        if self.max_field_length < SHA256_HEX_LENGTH:
+            raise ValueError("max_field_length must be at least 64")
 
     def constrained_by(self, other: ToolLimits) -> ToolLimits:
         return ToolLimits(
