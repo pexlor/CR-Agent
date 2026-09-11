@@ -1,0 +1,150 @@
+"""Deterministic application orchestration for one local review run."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Protocol
+from uuid import uuid4
+
+from code_review_agent.application.dto import (
+    ReviewProgressView,
+    ReviewRunResult,
+    StartReviewCommand,
+    TraceEventView,
+)
+
+
+class SessionPhase(StrEnum):
+    SESSION_ACQUIRED = "session_acquired"
+    INPUT_NORMALIZING = "input_normalizing"
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    CONSOLIDATING = "consolidating"
+    SNAPSHOTTING = "snapshotting"
+    REPORTING = "reporting"
+    COMPLETED = "completed"
+
+
+_PHASE_ORDER = tuple(SessionPhase)
+
+
+@dataclass(slots=True)
+class ExecutionSession:
+    task_id: str
+    session_id: str = field(default_factory=lambda: str(uuid4()))
+    phase: SessionPhase = SessionPhase.SESSION_ACQUIRED
+    _trace: list[TraceEventView] = field(default_factory=list)
+
+    def advance(self, target: SessionPhase) -> None:
+        current_index = _PHASE_ORDER.index(self.phase)
+        target_index = _PHASE_ORDER.index(target)
+        if target_index <= current_index:
+            raise ValueError("illegal_phase_transition")
+        if target_index != current_index + 1:
+            raise ValueError("illegal_phase_transition")
+        self.phase = target
+        self._trace.append(
+            TraceEventView(len(self._trace) + 1, target.value, "phase advanced")
+        )
+
+    @property
+    def trace(self) -> tuple[TraceEventView, ...]:
+        return tuple(self._trace)
+
+
+class ReviewSteps(Protocol):
+    def normalize(self, command: StartReviewCommand) -> Any: ...
+
+    def plan(self, normalized: Any) -> Any: ...
+
+    async def execute(self, unit: Any) -> Any: ...
+
+    def consolidate(
+        self, normalized: Any, plan: Any, executions: tuple[Any, ...]
+    ) -> Any: ...
+
+    def snapshot(
+        self,
+        command: StartReviewCommand,
+        normalized: Any,
+        plan: Any,
+        executions: tuple[Any, ...],
+        finding_set: Any,
+    ) -> Any: ...
+
+    def report(self, snapshot: Any) -> Any: ...
+
+    def deliver(self, model: Any, target: Path) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewDependencies:
+    steps: ReviewSteps
+    should_stop: Callable[[], bool] = lambda: False
+
+
+class ReviewOrchestrator:
+    """Owns ordering and stop boundaries, not domain review decisions."""
+
+    async def run(
+        self,
+        command: StartReviewCommand,
+        dependencies: ReviewDependencies,
+    ) -> ReviewRunResult:
+        session = ExecutionSession(command.task_id)
+        normalized = dependencies.steps.normalize(command)
+        session.advance(SessionPhase.INPUT_NORMALIZING)
+        plan = dependencies.steps.plan(normalized)
+        session.advance(SessionPhase.PLANNING)
+
+        executions: list[Any] = []
+        session.advance(SessionPhase.EXECUTING)
+        stop_requested = False
+        for unit in sorted(plan.work_units, key=lambda item: item.execution_rank):
+            if dependencies.should_stop():
+                stop_requested = True
+                break
+            executions.append(await dependencies.steps.execute(unit))
+
+        session.advance(SessionPhase.CONSOLIDATING)
+        finding_set = dependencies.steps.consolidate(
+            normalized, plan, tuple(executions)
+        )
+        session.advance(SessionPhase.SNAPSHOTTING)
+        snapshot = dependencies.steps.snapshot(
+            command, normalized, plan, tuple(executions), finding_set
+        )
+        model = dependencies.steps.report(snapshot)
+        session.advance(SessionPhase.REPORTING)
+        delivery = dependencies.steps.deliver(model, command.output_path)
+        session.advance(SessionPhase.COMPLETED)
+        state = str(getattr(snapshot, "result_state", "complete_no_findings"))
+        path = getattr(delivery, "path", command.output_path)
+        digest = getattr(delivery, "content_digest", None)
+        return ReviewRunResult(
+            task_id=command.task_id,
+            session_id=session.session_id,
+            phase=session.phase.value,
+            result_state=state,
+            delivery_state="succeeded",
+            report_path=path,
+            report_digest=digest,
+            limitations=("stop_requested",) if stop_requested else (),
+            trace=session.trace,
+        )
+
+    def progress(
+        self,
+        result: ReviewRunResult,
+        trace: tuple[TraceEventView, ...],
+    ) -> ReviewProgressView:
+        return ReviewProgressView(
+            task_id=result.task_id,
+            phase=result.phase,
+            result_state=result.result_state,
+            delivery_state=result.delivery_state,
+            trace=tuple(trace),
+        )
