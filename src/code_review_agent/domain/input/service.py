@@ -35,6 +35,7 @@ from code_review_agent.ports.input import InputProviderPort, SecurityBoundaryPor
 
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
+_GIT_FILE_MODE = re.compile(r"^(?:100644|100755|120000|160000)$")
 _NO_NEWLINE_MARKER = "\\ No newline at end of file"
 
 
@@ -327,9 +328,17 @@ class _UnifiedDiffParser:
             ):
                 recognized_fact = True
             elif body.startswith("new file mode "):
+                if new_file or not _GIT_FILE_MODE.fullmatch(
+                    body.removeprefix("new file mode ")
+                ):
+                    raise _MalformedDiff
                 new_file = True
                 recognized_fact = True
             elif body.startswith("deleted file mode "):
+                if deleted_file or not _GIT_FILE_MODE.fullmatch(
+                    body.removeprefix("deleted file mode ")
+                ):
+                    raise _MalformedDiff
                 deleted_file = True
                 recognized_fact = True
             elif body.startswith(("old mode ", "new mode ", "index ")):
@@ -341,9 +350,7 @@ class _UnifiedDiffParser:
                 binary = True
                 recognized_fact = True
             elif body == "GIT binary patch":
-                binary = True
-                recognized_fact = True
-                break
+                raise _MalformedDiff
             elif body == _NO_NEWLINE_MARKER:
                 if not hunk_drafts:
                     raise _MalformedDiff
