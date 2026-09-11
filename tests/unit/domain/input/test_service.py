@@ -7,7 +7,9 @@ from typing import Any, cast
 
 import pytest
 
+import code_review_agent.domain.input.service as input_service_module
 from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
+from code_review_agent.domain.common.digests import sha256_bytes
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.common.time import Clock, FixedClock
 from code_review_agent.domain.input.models import (
@@ -21,6 +23,8 @@ from code_review_agent.domain.input.models import (
 from code_review_agent.domain.input.service import InputService
 from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
+    ArtifactKind,
+    ArtifactPurpose,
     ScanResult,
     SecurityDecision,
     SecurityFinding,
@@ -87,6 +91,19 @@ def make_service(
 
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def diff_with_metadata(*metadata: str) -> str:
+    lines = "".join(f"{line}\n" for line in metadata)
+    return (
+        "diff --git a/app.py b/app.py\n"
+        f"{lines}"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
 
 
 def test_empty_diff_is_complete_no_change_input() -> None:
@@ -254,6 +271,81 @@ def test_repeated_old_new_marker_pair_is_rejected() -> None:
 
 
 @pytest.mark.parametrize(
+    "content",
+    [
+        diff_with_metadata("similarity index 101%"),
+        diff_with_metadata("dissimilarity index unknown"),
+        diff_with_metadata("old mode invalid", "new mode 100755"),
+        diff_with_metadata("old mode 100644", "new mode 777777"),
+        diff_with_metadata("index invalid"),
+        diff_with_metadata("index 1234567..abcdef0 777777"),
+    ],
+)
+def test_invalid_extended_metadata_is_rejected(content: str) -> None:
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        ("index 1234567..abcdef0 100644", "index 1234567..abcdef0 100644"),
+        ("old mode 100644",),
+        ("new mode 100755",),
+        ("old mode 100644", "new mode 100644"),
+        ("similarity index 90%", "similarity index 90%"),
+        ("similarity index 90%", "dissimilarity index 10%"),
+        ("similarity index 90%",),
+    ],
+)
+def test_unpaired_duplicate_or_conflicting_metadata_is_rejected(
+    metadata: tuple[str, ...],
+) -> None:
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(
+            task_id="task-1", text=diff_with_metadata(*metadata)
+        )
+
+    assert captured.value.code == "input_malformed"
+
+
+def test_file_lifecycle_mode_conflicts_with_old_new_mode_pair() -> None:
+    content = (
+        "diff --git a/app.py b/app.py\n"
+        "new file mode 100644\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "--- /dev/null\n"
+        "+++ b/app.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+new\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+
+
+def test_duplicate_rename_metadata_is_rejected() -> None:
+    content = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 100%\n"
+        "rename from old.py\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+
+
+@pytest.mark.parametrize(
     ("mode_line", "binary_line"),
     [
         ("new file mode not-a-mode", "Binary files /dev/null and b/image.bin differ"),
@@ -409,6 +501,83 @@ def test_text_and_file_forms_build_the_same_stable_review_object() -> None:
     ]
 
 
+def test_native_space_path_is_preserved() -> None:
+    content = (
+        "diff --git a/my file.py b/my file.py\n"
+        "--- a/my file.py\n"
+        "+++ b/my file.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    changed_file = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=content)
+        .change_set.files[0]
+    )
+
+    assert changed_file.old_path == "my file.py"
+    assert changed_file.new_path == "my file.py"
+
+
+def test_git_c_style_octal_utf8_path_is_decoded() -> None:
+    quoted_old = '"a/\\344\\270\\255\\346\\226\\207.py"'
+    quoted_new = '"b/\\344\\270\\255\\346\\226\\207.py"'
+    content = (
+        f"diff --git {quoted_old} {quoted_new}\n"
+        f"--- {quoted_old}\n"
+        f"+++ {quoted_new}\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    changed_file = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=content)
+        .change_set.files[0]
+    )
+
+    assert changed_file.old_path == "中文.py"
+    assert changed_file.new_path == "中文.py"
+
+
+def test_git_c_style_escaped_quote_path_is_decoded() -> None:
+    quoted_old = '"a/quote\\"name.py"'
+    quoted_new = '"b/quote\\"name.py"'
+    content = (
+        f"diff --git {quoted_old} {quoted_new}\n"
+        f"--- {quoted_old}\n"
+        f"+++ {quoted_new}\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    changed_file = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=content)
+        .change_set.files[0]
+    )
+
+    assert changed_file.new_path == 'quote"name.py'
+
+
+def test_git_c_style_path_is_validated_after_decoding() -> None:
+    quoted_old = '"a/safe\\057..\\057private.py"'
+    quoted_new = '"b/safe\\057..\\057private.py"'
+    content = (
+        f"diff --git {quoted_old} {quoted_new}\nold mode 100644\nnew mode 100755\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert "private.py" not in str(captured.value.to_dict())
+
+
 def test_malformed_input_returns_safe_stable_error() -> None:
     content = "this is not a diff\nSIMULATED_PRIVATE_VALUE"
 
@@ -553,6 +722,115 @@ def test_change_set_normalization_must_also_match_input_identity() -> None:
         )
 
 
+def test_line_rejects_tampered_id_location_or_content_reference() -> None:
+    result = make_service().normalize_plain_diff(
+        task_id="task-1", text=fixture("basic.diff")
+    )
+    line = result.change_set.files[0].hunks[0].lines[1]
+
+    with pytest.raises(ValueError):
+        replace(line, line_id="line_" + "0" * 64)
+    with pytest.raises(ValueError):
+        replace(line, old_line_number=99)
+    with pytest.raises(ValueError):
+        replace(
+            line,
+            content_ref=replace(line.content_ref, start=line.content_ref.start + 1),
+        )
+    with pytest.raises(ValueError):
+        replace(
+            line,
+            content_ref=replace(
+                line.content_ref,
+                artifact=replace(line.content_ref.artifact, artifact_id="forged"),
+            ),
+        )
+
+
+def test_hunk_rejects_tampered_id_digest_or_range() -> None:
+    hunk = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
+        .change_set.files[0]
+        .hunks[0]
+    )
+
+    with pytest.raises(ValueError):
+        replace(hunk, hunk_id="hunk_" + "0" * 64)
+    with pytest.raises(ValueError):
+        replace(hunk, content_digest="0" * 64)
+    with pytest.raises(ValueError):
+        replace(hunk, old_start=hunk.old_start + 1)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"file_id": "file_" + "0" * 64},
+        {"old_path": "other.py"},
+        {"language": "typescript"},
+    ],
+)
+def test_changed_file_rejects_tampered_derived_fields(
+    updates: dict[str, object],
+) -> None:
+    changed_file = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
+        .change_set.files[0]
+    )
+
+    with pytest.raises(ValueError):
+        replace(changed_file, **cast(Any, updates))
+
+
+def test_change_set_recomputes_canonical_id_and_digest() -> None:
+    change_set = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
+        .change_set
+    )
+    forged_digest = "0" * 64
+    forged_proof = replace(
+        change_set.completeness,
+        change_set_digest=forged_digest,
+    )
+
+    with pytest.raises(ValueError):
+        replace(change_set, change_set_id="changeset_" + "0" * 64)
+    with pytest.raises(ValueError):
+        replace(
+            change_set,
+            completeness=forged_proof,
+            change_set_digest=forged_digest,
+        )
+
+
+@pytest.mark.parametrize(
+    "reference_updates",
+    [
+        {"artifact_id": "forged"},
+        {"kind": ArtifactKind.REPORT_PAYLOAD},
+        {"purpose": ArtifactPurpose.PERSISTENCE},
+    ],
+)
+def test_change_set_rejects_tampered_sanitized_artifact_identity(
+    reference_updates: dict[str, object],
+) -> None:
+    change_set = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
+        .change_set
+    )
+    forged_reference = replace(
+        change_set.sanitized_diff_ref,
+        **cast(Any, reference_updates),
+    )
+
+    with pytest.raises(ValueError):
+        replace(change_set, sanitized_diff_ref=forged_reference)
+
+
 def test_change_set_coverage_must_exactly_classify_every_file() -> None:
     change_set = (
         make_service()
@@ -642,6 +920,34 @@ def test_more_than_10000_changed_lines_is_rejected_as_a_whole() -> None:
 
     assert captured.value.code == "input_too_large"
     assert captured.value.details == {"limit": 10_000, "metric": "changed_lines"}
+
+
+def test_changed_line_limit_stops_before_hashing_line_10001(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    added = "".join(f"+new-{i}\n" for i in range(10_001))
+    content = (
+        "diff --git a/large.py b/large.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/large.py\n"
+        "@@ -0,0 +1,10001 @@\n"
+        f"{added}"
+    )
+    digest_calls = 0
+
+    def counting_digest(value: bytes) -> str:
+        nonlocal digest_calls
+        digest_calls += 1
+        return sha256_bytes(value)
+
+    monkeypatch.setattr(input_service_module, "sha256_bytes", counting_digest)
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_too_large"
+    assert digest_calls == 10_000
 
 
 def test_exactly_10000_changed_lines_is_accepted() -> None:
