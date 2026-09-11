@@ -371,6 +371,10 @@ class _UnifiedDiffParser:
                 deleted_file and binary_old is None
             ):
                 raise _MalformedDiff
+            if (binary_old is None and not new_file) or (
+                binary_new is None and not deleted_file
+            ):
+                raise _MalformedDiff
             marker_old, marker_new = binary_paths
         if new_file:
             if has_markers and marker_old is not None:

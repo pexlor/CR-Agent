@@ -383,6 +383,7 @@ class ChangeSet:
             or proof.provider_version != self.identity.provider_version
             or proof.fixed_version != self.identity.content_digest
             or proof.normalization_version != self.normalization_version
+            or self.normalization_version != self.identity.normalization_version
             or self.schema_version != self.identity.schema_version
         ):
             raise ValueError("completeness proof identity mismatch")
