@@ -7,8 +7,8 @@ import pytest
 from code_review_agent.adapters.model.gateway import ModelGateway
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.execution.models import (
-    ModelCapabilities,
     ModelCallState,
+    ModelCapabilities,
     ModelRequestOptions,
     ModelUsage,
     PromptEnvelope,
@@ -25,9 +25,7 @@ from tests.fakes.model_provider import FakeModelProvider
 
 def capabilities(
     *,
-    strategies: tuple[StructuredOutputStrategy, ...] = tuple(
-        StructuredOutputStrategy
-    ),
+    strategies: tuple[StructuredOutputStrategy, ...] = tuple(StructuredOutputStrategy),
 ) -> ModelCapabilities:
     return ModelCapabilities(
         provider_id="fake",
@@ -196,6 +194,28 @@ async def test_unknown_after_send_is_conservatively_committed_without_retry() ->
 
 
 @pytest.mark.asyncio
+async def test_unknown_cannot_be_downgraded_by_reported_usage() -> None:
+    provider = FakeModelProvider(
+        capabilities(),
+        (
+            ProviderSendResult(
+                provider_state=ProviderState.UNKNOWN,
+                usage=ModelUsage(UsageState.KNOWN, 100, 50),
+            ),
+        ),
+    )
+    prepared = ModelGateway().prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+
+    outcome = await ModelGateway().send(provider, prepared, reservation_tokens=500)
+
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.accounted_tokens == 500
+    assert outcome.usage.state is UsageState.UNTRUSTED
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("usage", "action", "accounted"),
     (
@@ -254,9 +274,11 @@ async def test_trusted_actual_usage_can_be_below_or_above_reservation(
 
 
 @pytest.mark.asyncio
-async def test_unexpected_provider_exception_becomes_unknown_without_error_text() -> None:
+async def test_unexpected_provider_exception_becomes_unknown_without_error_text() -> (
+    None
+):
     class ExplodingProvider(FakeModelProvider):
-        async def send_prepared(self, request: object) -> ProviderSendResult:  # type: ignore[override]
+        async def send_prepared(self, request: object) -> ProviderSendResult:
             self.send_calls += 1
             raise RuntimeError("credential=top-secret")
 

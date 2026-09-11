@@ -65,9 +65,7 @@ class FakeModelProvider:
             dynamic_tools=(),
         )
 
-    async def send_prepared(
-        self, request: PreparedModelRequest
-    ) -> ProviderSendResult:
+    async def send_prepared(self, request: PreparedModelRequest) -> ProviderSendResult:
         self.send_calls += 1
         self.sent_requests.append(request)
         if not self._results:

@@ -84,9 +84,7 @@ def test_usage_requires_counts_only_when_known() -> None:
     missing = ModelUsage(UsageState.MISSING)
     assert missing.reported_total is None
 
-    untrusted = ModelUsage(
-        UsageState.UNTRUSTED, input_tokens=10, output_tokens=7
-    )
+    untrusted = ModelUsage(UsageState.UNTRUSTED, input_tokens=10, output_tokens=7)
     assert untrusted.reported_total == 17
 
     with pytest.raises(ValueError, match="known usage"):
