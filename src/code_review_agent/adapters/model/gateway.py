@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from code_review_agent.domain.budget.models import UsageState
+from code_review_agent.domain.common.digests import sha256_digest
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.execution.models import (
     ModelCallOutcome,
@@ -19,8 +22,18 @@ from code_review_agent.domain.execution.models import (
 from code_review_agent.ports.model import ModelGatewayPort
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedPermit:
+    provider: ModelGatewayPort
+    request: PreparedModelRequest
+    fingerprint: str
+
+
 class ModelGateway:
     """Enforce fixed call behavior around a single Provider adapter invocation."""
+
+    def __init__(self) -> None:
+        self._prepared: dict[int, _PreparedPermit] = {}
 
     def prepare(
         self,
@@ -40,7 +53,7 @@ class ModelGateway:
             or options.strategy not in capabilities.structured_output_strategies
             or options.max_output_tokens > capabilities.max_output_tokens
         ):
-            raise self._capability_error()
+            raise self._capability_error("model_prepare")
 
         try:
             prepared = provider.prepare_request(envelope, options)
@@ -56,7 +69,18 @@ class ModelGateway:
             ) from None
 
         if not self._prepared_request_matches(prepared, provider, options):
-            raise self._capability_error()
+            raise self._capability_error("model_prepare")
+        try:
+            provider_owns_request = provider.owns_prepared_request(prepared)
+        except Exception:
+            provider_owns_request = False
+        if not provider_owns_request:
+            raise self._capability_error("model_prepare")
+        self._prepared[id(prepared)] = _PreparedPermit(
+            provider=provider,
+            request=prepared,
+            fingerprint=self._request_fingerprint(prepared),
+        )
         return prepared
 
     async def send(
@@ -68,15 +92,30 @@ class ModelGateway:
     ) -> ModelCallOutcome:
         if type(reservation_tokens) is not int or reservation_tokens <= 0:
             raise ValueError("reservation tokens must be a positive integer")
-        if not self._prepared_request_matches(
-            request,
-            provider,
-            ModelRequestOptions(
-                strategy=request.strategy,
-                max_output_tokens=request.output_token_max,
-            ),
+        permit = self._prepared.get(id(request))
+        try:
+            provider_owns_request = provider.owns_prepared_request(request)
+        except Exception:
+            provider_owns_request = False
+        if (
+            permit is None
+            or permit.provider is not provider
+            or permit.request is not request
+            or permit.fingerprint != self._request_fingerprint(request)
+            or not provider_owns_request
+            or not self._prepared_request_matches(
+                request,
+                provider,
+                ModelRequestOptions(
+                    strategy=request.strategy,
+                    max_output_tokens=request.output_token_max,
+                ),
+            )
         ):
-            raise self._capability_error()
+            raise self._capability_error("model_send")
+
+        del self._prepared[id(request)]
+        usage_mapping_trusted = provider.capabilities.usage_mapping_trusted
 
         try:
             result = await provider.send_prepared(request)
@@ -85,7 +124,11 @@ class ModelGateway:
                 provider_state=ProviderState.UNKNOWN,
                 error_code="model_result_unknown",
             )
-        return self._outcome(result, reservation_tokens)
+        return self._outcome(
+            result,
+            reservation_tokens,
+            usage_mapping_trusted=usage_mapping_trusted,
+        )
 
     @staticmethod
     def _prepared_request_matches(
@@ -99,8 +142,13 @@ class ModelGateway:
             and request.provider_version == capabilities.provider_version
             and request.model_id == capabilities.model_id
             and request.origin == capabilities.origin
+            and request.method == capabilities.request_method
+            and request.path == capabilities.request_path
+            and dict(request.headers) == dict(capabilities.fixed_headers)
             and request.strategy is options.strategy
+            and request.strategy in capabilities.structured_output_strategies
             and request.output_token_max == options.max_output_tokens
+            and request.output_token_max <= capabilities.max_output_tokens
             and request.input_token_bound + request.output_token_max
             <= capabilities.context_token_limit
             and not request.streaming
@@ -110,8 +158,34 @@ class ModelGateway:
         )
 
     @staticmethod
+    def _request_fingerprint(request: PreparedModelRequest) -> str:
+        return sha256_digest(
+            {
+                "automatic_retries": request.automatic_retries,
+                "body_digest": request.body_digest,
+                "dynamic_tools": list(request.dynamic_tools),
+                "fallback_model_id": request.fallback_model_id,
+                "headers": dict(request.headers),
+                "input_token_bound": request.input_token_bound,
+                "method": request.method,
+                "model_id": request.model_id,
+                "origin": request.origin,
+                "output_token_max": request.output_token_max,
+                "path": request.path,
+                "preparation_id": request.preparation_id,
+                "provider_id": request.provider_id,
+                "provider_version": request.provider_version,
+                "strategy": request.strategy.value,
+                "streaming": request.streaming,
+            }
+        )
+
+    @staticmethod
     def _outcome(
-        result: ProviderSendResult, reservation_tokens: int
+        result: ProviderSendResult,
+        reservation_tokens: int,
+        *,
+        usage_mapping_trusted: bool,
     ) -> ModelCallOutcome:
         if (
             result.provider_state is ProviderState.FAILED_KNOWN
@@ -135,9 +209,8 @@ class ModelGateway:
         )
         usage = result.usage
         if (
-            result.provider_state is ProviderState.UNKNOWN
-            and usage.state is UsageState.KNOWN
-        ):
+            result.provider_state is ProviderState.UNKNOWN or not usage_mapping_trusted
+        ) and usage.state is UsageState.KNOWN:
             usage = ModelUsage(
                 UsageState.UNTRUSTED,
                 input_tokens=usage.input_tokens,
@@ -172,11 +245,11 @@ class ModelGateway:
         )
 
     @staticmethod
-    def _capability_error() -> StableError:
+    def _capability_error(stage: str) -> StableError:
         return StableError(
             code="model_capability_mismatch",
             category="provider",
-            stage="model_prepare",
+            stage=stage,
             recoverable=False,
             next_actions=("change_task_configuration",),
         )

@@ -12,6 +12,57 @@ from code_review_agent.domain.budget.models import UsageState as UsageState
 from code_review_agent.domain.common.digests import sha256_bytes
 
 _STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
+_HEADER_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_AUTH_HEADERS = frozenset(
+    {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+)
+
+
+def _deep_freeze_json(value: object) -> object:
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("JSON object keys must be strings")
+            frozen[key] = _deep_freeze_json(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_json(item) for item in value)
+    raise TypeError("value must be JSON-compatible")
+
+
+def _freeze_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
+    normalized = dict(headers)
+    if not normalized:
+        raise ValueError("fixed non-authentication headers are required")
+    for name, value in normalized.items():
+        if (
+            not isinstance(name, str)
+            or not _HEADER_NAME.fullmatch(name)
+            or name in _AUTH_HEADERS
+        ):
+            raise ValueError(
+                "prepared headers must be lowercase and non-authentication"
+            )
+        if not isinstance(value, str) or not value or "\r" in value or "\n" in value:
+            raise ValueError("prepared header values must be fixed safe strings")
+    return MappingProxyType(normalized)
+
+
+def _validate_wire_target(method: str, path: str) -> None:
+    if method != "POST":
+        raise ValueError("model request method must be fixed to POST")
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or path.startswith("//")
+        or "://" in path
+        or "?" in path
+        or "#" in path
+    ):
+        raise ValueError("model request path must be a fixed relative API path")
 
 
 class ProviderState(StrEnum):
@@ -101,6 +152,9 @@ class ModelCapabilities:
     streaming_disabled: bool
     retries_disabled: bool
     dynamic_tools_disabled: bool
+    request_method: str
+    request_path: str
+    fixed_headers: Mapping[str, str]
 
     def __post_init__(self) -> None:
         if not all(
@@ -128,6 +182,8 @@ class ModelCapabilities:
                 "structured output strategies must be unique and non-empty"
             )
         object.__setattr__(self, "structured_output_strategies", strategies)
+        _validate_wire_target(self.request_method, self.request_path)
+        object.__setattr__(self, "fixed_headers", _freeze_headers(self.fixed_headers))
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,22 +191,36 @@ class PromptEnvelope:
     system_rules: str
     work_unit: str
     diff: str
+    controlled_context: tuple[str, ...]
     tool_facts: tuple[str, ...]
+    prohibited_capabilities: tuple[str, ...]
+    version_digest: str
     output_schema: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        if not self.system_rules or not self.work_unit:
-            raise ValueError("prompt rules and work unit are required")
+        if not self.system_rules or not self.work_unit or not self.version_digest:
+            raise ValueError("prompt rules, work unit, and version digest are required")
         if not isinstance(self.diff, str):
             raise TypeError("prompt diff must be text")
+        context = tuple(self.controlled_context)
         facts = tuple(self.tool_facts)
-        if any(not isinstance(fact, str) or not fact for fact in facts):
-            raise ValueError("tool facts must be non-empty strings")
-        schema = dict(self.output_schema)
+        prohibited = tuple(self.prohibited_capabilities)
+        if any(
+            not isinstance(item, str) or not item
+            for item in (*context, *facts, *prohibited)
+        ):
+            raise ValueError("prompt list fields must contain non-empty strings")
+        if not prohibited:
+            raise ValueError("prompt prohibited capabilities are required")
+        schema = _deep_freeze_json(self.output_schema)
+        if not isinstance(schema, Mapping):
+            raise TypeError("output schema must be an object")
         if schema.get("type") != "object":
             raise ValueError("output schema must describe an object")
+        object.__setattr__(self, "controlled_context", context)
         object.__setattr__(self, "tool_facts", facts)
-        object.__setattr__(self, "output_schema", MappingProxyType(schema))
+        object.__setattr__(self, "prohibited_capabilities", prohibited)
+        object.__setattr__(self, "output_schema", schema)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,9 +255,10 @@ class PreparedModelRequest:
     origin: str
     method: str
     path: str
-    header_names: tuple[str, ...]
+    headers: Mapping[str, str]
     body: bytes
     body_digest: str
+    preparation_id: str
     strategy: StructuredOutputStrategy
     input_token_bound: int
     output_token_max: int
@@ -207,6 +278,7 @@ class PreparedModelRequest:
                 self.method,
                 self.path,
                 self.body_digest,
+                self.preparation_id,
             )
         ):
             raise ValueError("prepared request identity is required")
@@ -214,6 +286,7 @@ class PreparedModelRequest:
             raise ValueError("prepared request body must be non-empty bytes")
         if sha256_bytes(self.body) != self.body_digest:
             raise ValueError("prepared request body digest mismatch")
+        _validate_wire_target(self.method, self.path)
         if (
             type(self.input_token_bound) is not int
             or type(self.output_token_max) is not int
@@ -221,7 +294,7 @@ class PreparedModelRequest:
             or self.output_token_max <= 0
         ):
             raise ValueError("prepared request token bounds are invalid")
-        object.__setattr__(self, "header_names", tuple(self.header_names))
+        object.__setattr__(self, "headers", _freeze_headers(self.headers))
         object.__setattr__(self, "dynamic_tools", tuple(self.dynamic_tools))
 
 
