@@ -1,13 +1,14 @@
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from code_review_agent.adapters.sqlite.connection import connect_database
-from code_review_agent.adapters.sqlite.migrations import MigrationError, apply_migrations
+from code_review_agent.adapters.sqlite.migrations import apply_migrations
 from code_review_agent.adapters.sqlite.unit_of_work import SQLiteUnitOfWork
 
 
-def test_database_connection_uses_required_durability_pragmas(tmp_path) -> None:
+def test_database_connection_uses_required_durability_pragmas(tmp_path: Path) -> None:
     connection = connect_database(tmp_path / "state.sqlite3")
 
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -17,7 +18,7 @@ def test_database_connection_uses_required_durability_pragmas(tmp_path) -> None:
     connection.close()
 
 
-def test_migrations_are_idempotent_and_record_schema_version(tmp_path) -> None:
+def test_migrations_are_idempotent_and_record_schema_version(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     first = connect_database(database)
     apply_migrations(first)
@@ -39,26 +40,28 @@ def test_migrations_are_idempotent_and_record_schema_version(tmp_path) -> None:
     second.close()
 
 
-def test_foreign_keys_and_constraints_are_enforced(tmp_path) -> None:
+def test_foreign_keys_and_constraints_are_enforced(tmp_path: Path) -> None:
     connection = connect_database(tmp_path / "state.sqlite3")
     apply_migrations(connection)
 
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
-            "INSERT INTO input_bindings(binding_id, task_id, input_type, content_digest) "
+            "INSERT INTO input_bindings(binding_id, task_id, input_type, "
+            "content_digest) "
             "VALUES (?, ?, ?, ?)",
             ("binding", "missing-task", "plain_diff", "digest"),
         )
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
-            "INSERT INTO tasks(task_id, spec_id, control_state, phase, result_state, delivery_state, version) "
+            "INSERT INTO tasks(task_id, spec_id, control_state, phase, result_state, "
+            "delivery_state, version) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("task", "spec", "invalid", "created", "pending", "not_ready", 1),
         )
     connection.close()
 
 
-def test_uow_commit_and_rollback_are_atomic(tmp_path) -> None:
+def test_uow_commit_and_rollback_are_atomic(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     connection = connect_database(database)
     apply_migrations(connection)
@@ -79,26 +82,27 @@ def test_uow_commit_and_rollback_are_atomic(tmp_path) -> None:
         )
     assert connection.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
 
-    with pytest.raises(RuntimeError):
-        with uow:
-            uow.execute_typed(
-                "insert_task",
-                {
-                    "task_id": "task-2",
-                    "spec_id": "spec-2",
-                    "control_state": "ready",
-                    "phase": "created",
-                    "result_state": "pending",
-                    "delivery_state": "not_ready",
-                    "version": 1,
-                },
-            )
-            raise RuntimeError("rollback")
+    with pytest.raises(RuntimeError), uow:
+        uow.execute_typed(
+            "insert_task",
+            {
+                "task_id": "task-2",
+                "spec_id": "spec-2",
+                "control_state": "ready",
+                "phase": "created",
+                "result_state": "pending",
+                "delivery_state": "not_ready",
+                "version": 1,
+            },
+        )
+        raise RuntimeError("rollback")
     assert connection.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
     connection.close()
 
 
-def test_uow_rejects_arbitrary_sql_and_repositories_do_not_expose_execute(tmp_path) -> None:
+def test_uow_rejects_arbitrary_sql_and_repositories_do_not_expose_execute(
+    tmp_path: Path,
+) -> None:
     connection = connect_database(tmp_path / "state.sqlite3")
     apply_migrations(connection)
     uow = SQLiteUnitOfWork(connection)
