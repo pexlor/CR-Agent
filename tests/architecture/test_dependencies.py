@@ -3,8 +3,7 @@
 import ast
 from pathlib import Path
 
-
-FORBIDDEN_MODULES = (
+FORBIDDEN_MODULES = {
     "typer",
     "rich",
     "sqlite3",
@@ -14,7 +13,7 @@ FORBIDDEN_MODULES = (
     "httpx",
     "keyring",
     "jinja2",
-)
+}
 
 
 def test_domain_does_not_import_adapter_dependencies() -> None:
@@ -23,12 +22,13 @@ def test_domain_does_not_import_adapter_dependencies() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                names = (alias.name for alias in node.names)
+                names = tuple(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 names = (node.module or "",)
             else:
                 continue
             for name in names:
-                assert not name == FORBIDDEN_MODULES[0] and not name.startswith(
-                    tuple(FORBIDDEN_MODULES[1:])
-                ), f"{path} imports forbidden dependency {name}"
+                root_module = name.partition(".")[0]
+                assert root_module not in FORBIDDEN_MODULES, (
+                    f"{path} imports forbidden dependency {name}"
+                )
