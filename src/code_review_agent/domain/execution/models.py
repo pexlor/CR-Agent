@@ -160,6 +160,15 @@ class ModelCapabilities:
             )
         ):
             raise ValueError("model capability identity is required")
+        boolean_flags = (
+            self.preflight_token_counting,
+            self.usage_mapping_trusted,
+            self.streaming_disabled,
+            self.retries_disabled,
+            self.dynamic_tools_disabled,
+        )
+        if any(type(value) is not bool for value in boolean_flags):
+            raise TypeError("model capability flags must be bool values")
         if not self.origin.startswith("https://"):
             raise ValueError("model provider origin must use HTTPS")
         if (
