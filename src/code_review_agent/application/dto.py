@@ -13,11 +13,16 @@ class StartReviewCommand:
     diff_file: Path | None
     output_path: Path
     subject: str = "Local diff review"
+    source_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id:
             raise ValueError("task_id is required")
-        if (self.diff_text is None) == (self.diff_file is None):
+        sources = sum(
+            value is not None
+            for value in (self.diff_text, self.diff_file, self.source_url)
+        )
+        if sources != 1:
             raise ValueError("exactly one diff source is required")
 
 

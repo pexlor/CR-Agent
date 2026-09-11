@@ -1,12 +1,23 @@
-"""CLI entry point placeholder."""
+"""CLI entry point."""
 
-import sys
+from __future__ import annotations
 
-NOT_IMPLEMENTED_EXIT_CODE = 2
+from collections.abc import Callable
+
+import typer
+
+from code_review_agent.bootstrap import CliRuntime, build_runtime
+from code_review_agent.cli.commands import build_commands
+
+
+def create_app(
+    runtime_factory: Callable[[], CliRuntime] = build_runtime,
+) -> typer.Typer:
+    return build_commands(runtime_factory)
+
+
+app = create_app()
 
 
 def main() -> None:
-    """Return a stable not-yet-implemented status until the CLI is built."""
-
-    print("code-review-agent: CLI commands are not implemented yet", file=sys.stderr)
-    raise SystemExit(NOT_IMPLEMENTED_EXIT_CODE)
+    app()
