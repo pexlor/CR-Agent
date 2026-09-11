@@ -25,7 +25,9 @@ def event(event_type: str, key: str, summary: dict[str, object]) -> TraceEventDr
 def test_events_get_contiguous_task_sequence_and_idempotent_replay() -> None:
     service = TraceService()
     first = service.prepare_events(
-        "task-1", "task_creation", [event("task.created", "create", {"status": "created"})]
+        "task-1",
+        "task_creation",
+        [event("task.created", "create", {"status": "created"})],
     )
     committed = service.commit(first)
     replay = service.commit(first)
@@ -34,13 +36,17 @@ def test_events_get_contiguous_task_sequence_and_idempotent_replay() -> None:
     assert replay == committed
     second = service.commit(
         service.prepare_events(
-            "task-1", "execution", [event("task.execution_started", "run", {"status": "running"})]
+            "task-1",
+            "execution",
+            [event("task.execution_started", "run", {"status": "running"})],
         )
     )
     assert second[0].sequence == 2
 
     conflict = service.prepare_events(
-        "task-1", "execution", [event("task.execution_started", "run", {"status": "different"})]
+        "task-1",
+        "execution",
+        [event("task.execution_started", "run", {"status": "different"})],
     )
     with pytest.raises(ValueError):
         service.commit(conflict)
@@ -50,7 +56,9 @@ def test_edges_are_same_task_and_events_are_append_only() -> None:
     service = TraceService()
     created = service.commit(
         service.prepare_events(
-            "task-1", "creation", [event("task.created", "create", {"status": "created"})]
+            "task-1",
+            "creation",
+            [event("task.created", "create", {"status": "created"})],
         )
     )[0]
     with pytest.raises(ValueError):

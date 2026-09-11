@@ -28,7 +28,7 @@ def test_event_draft_rejects_free_text_reasoning_and_non_scalar_summary() -> Non
     with pytest.raises(ValueError):
         draft(summary={"reasoning": "private chain of thought"})
     with pytest.raises(TypeError):
-        draft(summary={"nested": {"raw": "response"}})  # type: ignore[arg-type]
+        draft(summary={"nested": {"raw": "response"}})
 
 
 def test_envelope_and_link_are_immutable_and_link_requires_direct_evidence() -> None:
