@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from code_review_agent.domain.budget.models import UsageState as UsageState
 from code_review_agent.domain.common.digests import sha256_bytes
 
 _STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
+_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _FIXED_HEADER_ALLOWLIST = frozenset(
     {"accept", "content-type", "anthropic-version", "anthropic-beta"}
 )
 
 
 def _deep_freeze_json(value: object) -> object:
-    if value is None or type(value) in (bool, int, float, str):
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
         return value
     if isinstance(value, Mapping):
         frozen: dict[str, object] = {}
@@ -58,6 +65,33 @@ def _validate_wire_target(method: str, path: str) -> None:
         raise ValueError("model request path must be a fixed relative API path")
 
 
+def _validate_origin(origin: str) -> None:
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("model provider origin is invalid") from exc
+    hostname = parsed.hostname
+    hostname_valid = (
+        hostname is not None
+        and len(hostname) <= 253
+        and all(_HOST_LABEL.fullmatch(label) for label in hostname.split("."))
+    )
+    expected_netloc = hostname if port is None else f"{hostname}:{port}"
+    if (
+        parsed.scheme != "https"
+        or not hostname_valid
+        or parsed.netloc != expected_netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or port not in (None, 443)
+    ):
+        raise ValueError("model provider origin must be a strict HTTPS origin")
+
+
 class ProviderState(StrEnum):
     PENDING = "pending"
     RESERVED = "reserved"
@@ -93,6 +127,10 @@ class ModelCallState:
     response_state: ResponseState
 
     def __post_init__(self) -> None:
+        if type(self.provider_state) is not ProviderState:
+            raise TypeError("provider state must be a ProviderState")
+        if type(self.response_state) is not ResponseState:
+            raise TypeError("response state must be a ResponseState")
         if self.provider_state is ProviderState.SUCCEEDED:
             if self.response_state is ResponseState.NOT_AVAILABLE:
                 raise ValueError("provider success requires a response state")
@@ -107,6 +145,8 @@ class ModelUsage:
     output_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        if type(self.state) is not UsageState:
+            raise TypeError("usage state must be a UsageState")
         values = (self.input_tokens, self.output_tokens)
         if any(
             value is not None and (type(value) is not int or value < 0)
@@ -169,8 +209,7 @@ class ModelCapabilities:
         )
         if any(type(value) is not bool for value in boolean_flags):
             raise TypeError("model capability flags must be bool values")
-        if not self.origin.startswith("https://"):
-            raise ValueError("model provider origin must use HTTPS")
+        _validate_origin(self.origin)
         if (
             type(self.context_token_limit) is not int
             or type(self.max_output_tokens) is not int
@@ -309,6 +348,12 @@ class ProviderSendResult:
     error_code: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.provider_state) is not ProviderState:
+            raise TypeError("provider result state must be a ProviderState")
+        if self.request_sent is not None and type(self.request_sent) is not bool:
+            raise TypeError("request_sent must be a bool or None")
+        if not isinstance(self.usage, ModelUsage):
+            raise TypeError("provider usage must be ModelUsage")
         if self.provider_state not in {
             ProviderState.SUCCEEDED,
             ProviderState.FAILED_KNOWN,
@@ -324,11 +369,22 @@ class ProviderSendResult:
             raise ValueError("provider response is only valid after success")
         if self.provider_state is ProviderState.UNKNOWN and self.request_sent is False:
             raise ValueError("an unsent request cannot have unknown provider state")
+        if (
+            self.provider_state is ProviderState.FAILED_KNOWN
+            and self.request_sent is False
+            and self.usage.state is UsageState.KNOWN
+        ):
+            raise ValueError("unsent provider failure cannot have known usage")
         if self.error_code is not None and not _STABLE_CODE.fullmatch(self.error_code):
             raise ValueError("provider error code must be a stable name")
         if self.response_payload is not None:
+            payload = _deep_freeze_json(self.response_payload)
+            if not isinstance(payload, Mapping):
+                raise TypeError("provider response payload must be a JSON object")
             object.__setattr__(
-                self, "response_payload", MappingProxyType(dict(self.response_payload))
+                self,
+                "response_payload",
+                payload,
             )
 
 
@@ -343,9 +399,25 @@ class ModelCallOutcome:
     error_code: str | None = None
 
     def __post_init__(self) -> None:
-        if self.accounted_tokens < 0 or self.overage_tokens < 0:
+        if not isinstance(self.state, ModelCallState):
+            raise TypeError("model outcome state must be ModelCallState")
+        if type(self.reservation_action) is not ReservationAction:
+            raise TypeError("reservation action must be ReservationAction")
+        if not isinstance(self.usage, ModelUsage):
+            raise TypeError("model outcome usage must be ModelUsage")
+        if (
+            type(self.accounted_tokens) is not int
+            or type(self.overage_tokens) is not int
+            or self.accounted_tokens < 0
+            or self.overage_tokens < 0
+        ):
             raise ValueError("accounted usage and overage must be non-negative")
         if self.response_payload is not None:
+            payload = _deep_freeze_json(self.response_payload)
+            if not isinstance(payload, Mapping):
+                raise TypeError("model outcome payload must be a JSON object")
             object.__setattr__(
-                self, "response_payload", MappingProxyType(dict(self.response_payload))
+                self,
+                "response_payload",
+                payload,
             )

@@ -80,7 +80,7 @@ class FakeModelProvider:
             body_digest=sha256_bytes(body),
             preparation_id=preparation_id,
             strategy=options.strategy,
-            input_token_bound=len(body),
+            input_token_bound=300,
             output_token_max=options.max_output_tokens,
             streaming=False,
             automatic_retries=0,
@@ -93,10 +93,20 @@ class FakeModelProvider:
     def owns_prepared_request(self, request: PreparedModelRequest) -> bool:
         return self._prepared_requests.get(request.preparation_id) is request
 
+    @property
+    def active_prepare_count(self) -> int:
+        return len(self._prepared_requests)
+
+    def discard_prepared(self, request: PreparedModelRequest) -> None:
+        for preparation_id, prepared in tuple(self._prepared_requests.items()):
+            if prepared is request:
+                del self._prepared_requests[preparation_id]
+                return
+
     async def send_prepared(self, request: PreparedModelRequest) -> ProviderSendResult:
         if not self.owns_prepared_request(request):
             raise ValueError("request has no valid prepare permit")
-        del self._prepared_requests[request.preparation_id]
+        self.discard_prepared(request)
         self.send_calls += 1
         self.sent_requests.append(request)
         if not self._results:

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 
-from code_review_agent.domain.budget.models import UsageState
+from code_review_agent.domain.budget.models import (
+    BudgetReservation,
+    ReservationState,
+    UsageState,
+)
 from code_review_agent.domain.common.digests import sha256_bytes, sha256_digest
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.execution.models import (
@@ -44,7 +49,12 @@ class ModelGateway:
         envelope: PromptEnvelope,
         options: ModelRequestOptions,
     ) -> PreparedModelRequest:
-        capabilities = provider.capabilities
+        try:
+            capabilities = provider.capabilities
+        except Exception:
+            raise self._provider_error("model_prepare") from None
+        if not isinstance(capabilities, ModelCapabilities):
+            raise self._provider_error("model_prepare")
         if (
             options.streaming
             or options.automatic_retries != 0
@@ -72,21 +82,30 @@ class ModelGateway:
                 next_actions=("retry_explicitly",),
             ) from None
 
-        if not self._prepared_request_matches(prepared, provider, options):
-            raise self._capability_error("model_prepare")
         try:
+            request_matches = self._prepared_request_matches(
+                prepared, capabilities, options
+            )
             provider_owns_request = provider.owns_prepared_request(prepared)
         except Exception:
-            provider_owns_request = False
-        if not provider_owns_request:
+            self._discard_provider(provider, prepared)
+            raise self._capability_error("model_prepare") from None
+        if not request_matches or provider_owns_request is not True:
+            self._discard_provider(provider, prepared)
             raise self._capability_error("model_prepare")
-        capability_snapshot = replace(capabilities)
+        try:
+            capability_snapshot = replace(capabilities)
+            capability_digest = self._capability_fingerprint(capability_snapshot)
+            request_fingerprint = self._request_fingerprint(prepared)
+        except Exception:
+            self._discard_provider(provider, prepared)
+            raise self._capability_error("model_prepare") from None
         self._prepared[id(prepared)] = _PreparedPermit(
             provider=provider,
             request=prepared,
-            fingerprint=self._request_fingerprint(prepared),
+            fingerprint=request_fingerprint,
             capabilities=capability_snapshot,
-            capability_digest=self._capability_fingerprint(capability_snapshot),
+            capability_digest=capability_digest,
         )
         return prepared
 
@@ -95,60 +114,89 @@ class ModelGateway:
         provider: ModelGatewayPort,
         request: PreparedModelRequest,
         *,
-        reservation_tokens: int,
+        reservation: BudgetReservation,
     ) -> ModelCallOutcome:
-        if type(reservation_tokens) is not int or reservation_tokens <= 0:
-            raise ValueError("reservation tokens must be a positive integer")
         permit = self._prepared.get(id(request))
         try:
             provider_owns_request = provider.owns_prepared_request(request)
         except Exception:
-            provider_owns_request = False
-        current_capabilities = provider.capabilities
-        if (
-            permit is None
-            or permit.provider is not provider
-            or permit.request is not request
-            or permit.fingerprint != self._request_fingerprint(request)
-            or not self._body_digest_matches(request)
-            or current_capabilities != permit.capabilities
-            or self._capability_fingerprint(current_capabilities)
-            != permit.capability_digest
-            or not provider_owns_request
-            or not self._prepared_request_matches(
-                request,
-                provider,
-                ModelRequestOptions(
-                    strategy=request.strategy,
-                    max_output_tokens=request.output_token_max,
-                ),
+            self.discard_prepared(provider, request)
+            raise self._provider_error("model_send") from None
+        try:
+            current_capabilities = provider.capabilities
+        except Exception:
+            self.discard_prepared(provider, request)
+            raise self._provider_error("model_send") from None
+        try:
+            request_is_valid = (
+                permit is not None
+                and permit.provider is provider
+                and permit.request is request
+                and permit.fingerprint == self._request_fingerprint(request)
+                and self._body_digest_matches(request)
+                and isinstance(current_capabilities, ModelCapabilities)
+                and current_capabilities == permit.capabilities
+                and self._capability_fingerprint(current_capabilities)
+                == permit.capability_digest
+                and provider_owns_request is True
+                and self._prepared_request_matches(
+                    request,
+                    permit.capabilities,
+                    ModelRequestOptions(
+                        strategy=request.strategy,
+                        max_output_tokens=request.output_token_max,
+                    ),
+                )
             )
-        ):
+        except Exception:
+            request_is_valid = False
+        if not request_is_valid or permit is None:
+            self.discard_prepared(provider, request)
             raise self._capability_error("model_send")
+        if not self._reservation_matches(reservation, request):
+            self.discard_prepared(provider, request)
+            raise self._reservation_error()
 
         del self._prepared[id(request)]
         usage_mapping_trusted = permit.capabilities.usage_mapping_trusted
 
         try:
             result = await provider.send_prepared(request)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            result = ProviderSendResult(
-                provider_state=ProviderState.UNKNOWN,
-                error_code="model_result_unknown",
+            return self._unknown_outcome(reservation.amount)
+        finally:
+            self._discard_provider(provider, request)
+        if not isinstance(result, ProviderSendResult):
+            return self._unknown_outcome(reservation.amount)
+        try:
+            return self._outcome(
+                result,
+                reservation.amount,
+                usage_mapping_trusted=usage_mapping_trusted,
             )
-        return self._outcome(
-            result,
-            reservation_tokens,
-            usage_mapping_trusted=usage_mapping_trusted,
-        )
+        except Exception:
+            return self._unknown_outcome(reservation.amount)
+
+    def discard_prepared(
+        self, provider: ModelGatewayPort, request: PreparedModelRequest
+    ) -> None:
+        """Idempotently release Gateway and Provider preparation state."""
+
+        permit = self._prepared.pop(id(request), None)
+        discarded = self._discard_provider(provider, request)
+        if permit is not None and permit.provider is not provider:
+            discarded = self._discard_provider(permit.provider, request) and discarded
+        if not discarded:
+            raise self._provider_error("model_discard")
 
     @staticmethod
     def _prepared_request_matches(
         request: PreparedModelRequest,
-        provider: ModelGatewayPort,
+        capabilities: ModelCapabilities,
         options: ModelRequestOptions,
     ) -> bool:
-        capabilities = provider.capabilities
         return (
             request.provider_id == capabilities.provider_id
             and request.provider_version == capabilities.provider_version
@@ -228,16 +276,55 @@ class ModelGateway:
         )
 
     @staticmethod
+    def _reservation_matches(
+        reservation: BudgetReservation, request: PreparedModelRequest
+    ) -> bool:
+        if not isinstance(reservation, BudgetReservation):
+            return False
+        expected_amount = request.input_token_bound + request.output_token_max
+        return (
+            reservation.state is ReservationState.ACTIVE
+            and reservation.prepared_request_digest == request.body_digest
+            and reservation.input_bound == request.input_token_bound
+            and reservation.output_max == request.output_token_max
+            and reservation.amount == expected_amount
+        )
+
+    @staticmethod
+    def _discard_provider(
+        provider: ModelGatewayPort, request: PreparedModelRequest
+    ) -> bool:
+        try:
+            provider.discard_prepared(request)
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _unknown_outcome(reservation_tokens: int) -> ModelCallOutcome:
+        return ModelCallOutcome(
+            state=ModelCallState(ProviderState.UNKNOWN, ResponseState.NOT_AVAILABLE),
+            reservation_action=ReservationAction.SETTLE_UNCERTAIN,
+            usage=ModelUsage(UsageState.MISSING),
+            accounted_tokens=reservation_tokens,
+            overage_tokens=0,
+            error_code="model_result_unknown",
+        )
+
+    @staticmethod
     def _outcome(
         result: ProviderSendResult,
         reservation_tokens: int,
         *,
         usage_mapping_trusted: bool,
     ) -> ModelCallOutcome:
+        result.__post_init__()
         if (
             result.provider_state is ProviderState.FAILED_KNOWN
             and result.request_sent is False
         ):
+            if result.usage.state is not UsageState.MISSING:
+                raise ValueError("unsent failure usage is contradictory")
             return ModelCallOutcome(
                 state=ModelCallState(
                     ProviderState.FAILED_KNOWN, ResponseState.NOT_AVAILABLE
@@ -299,4 +386,24 @@ class ModelGateway:
             stage=stage,
             recoverable=False,
             next_actions=("change_task_configuration",),
+        )
+
+    @staticmethod
+    def _provider_error(stage: str) -> StableError:
+        return StableError(
+            code="model_failed_known",
+            category="provider",
+            stage=stage,
+            recoverable=True,
+            next_actions=("retry_explicitly",),
+        )
+
+    @staticmethod
+    def _reservation_error() -> StableError:
+        return StableError(
+            code="budget_reservation_rejected",
+            category="budget",
+            stage="model_send",
+            recoverable=True,
+            next_actions=("reserve_budget",),
         )
