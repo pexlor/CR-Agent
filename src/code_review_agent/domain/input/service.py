@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -70,21 +71,45 @@ class InputService:
             if text is not None
             else self._provider.acquire_file(task_id=task_id, path=file_path)  # type: ignore[arg-type]
         )
-        if (
-            acquired.byte_count == 0
-            and acquired.identity.content_digest == sha256_bytes(b"")
-            and acquired.artifact_ref.sanitized_digest == ""
-        ):
-            sanitized = ""
-        else:
-            try:
-                sanitized = self._security.resolve(
-                    acquired.artifact_ref,
-                    expected_purpose=ArtifactPurpose.DOMAIN_INGRESS,
-                )
-            except (RuntimeError, TypeError, ValueError) as exc:
-                raise _error("security_boundary_failed") from exc
+        sanitized: str | None = None
+        with suppress(RuntimeError, TypeError, ValueError):
+            sanitized = self._security.resolve(
+                acquired.artifact_ref,
+                expected_purpose=ArtifactPurpose.DOMAIN_INGRESS,
+            )
+        if sanitized is None:
+            raise _error("security_boundary_failed")
 
+        result: NormalizedInput | None = None
+        failure: StableError | None = None
+        try:
+            result = self._normalize_committed(
+                task_id=task_id,
+                acquired=acquired,
+                sanitized=sanitized,
+            )
+        except _TooLarge as exc:
+            failure = _error(
+                "input_too_large",
+                details={"metric": exc.metric, "limit": exc.limit},
+            )
+        except _IncompleteDiff:
+            failure = _error("input_incomplete")
+        except (_MalformedDiff, ValueError):
+            failure = _error("input_malformed")
+        if failure is not None:
+            raise failure
+        if result is None:
+            raise RuntimeError("input normalization produced no result")
+        return result
+
+    def _normalize_committed(
+        self,
+        *,
+        task_id: str,
+        acquired: AcquiredPlainDiff,
+        sanitized: str,
+    ) -> NormalizedInput:
         change_set_id = "changeset_" + sha256_digest(
             {
                 "identity": acquired.identity.identity_digest,
@@ -92,22 +117,12 @@ class InputService:
                 "schema_major": 1,
             }
         )
-        try:
-            files = _UnifiedDiffParser(
-                content=sanitized,
-                acquired=acquired,
-                limits=self._limits,
-                change_set_id=change_set_id,
-            ).parse()
-        except _TooLarge as exc:
-            raise _error(
-                "input_too_large",
-                details={"metric": exc.metric, "limit": exc.limit},
-            ) from exc
-        except _IncompleteDiff as exc:
-            raise _error("input_incomplete") from exc
-        except _MalformedDiff as exc:
-            raise _error("input_malformed") from exc
+        files = _UnifiedDiffParser(
+            content=sanitized,
+            acquired=acquired,
+            limits=self._limits,
+            change_set_id=change_set_id,
+        ).parse()
 
         changed_line_count = sum(item.additions + item.deletions for item in files)
         reviewable = tuple(item.file_id for item in files if not item.is_binary)
@@ -251,8 +266,13 @@ class _UnifiedDiffParser:
             raise _TooLarge("files", self._limits.max_files)
 
         files: list[ChangedFile] = []
+        seen_sections: set[tuple[str, str]] = set()
         changed_line_count = 0
         for section in sections:
+            section_identity = _parse_diff_header(section[0].body)
+            if section_identity in seen_sections:
+                raise _MalformedDiff
+            seen_sections.add(section_identity)
             changed_file = self._parse_file(section)
             changed_line_count += changed_file.additions + changed_file.deletions
             if changed_line_count > self._limits.max_changed_lines:
@@ -266,6 +286,7 @@ class _UnifiedDiffParser:
         marker_new: str | None = header_new
         has_markers = False
         binary = False
+        binary_paths: tuple[str | None, str | None] | None = None
         renamed = header_old != header_new
         new_file = False
         deleted_file = False
@@ -314,7 +335,9 @@ class _UnifiedDiffParser:
             elif body.startswith(("old mode ", "new mode ", "index ")):
                 recognized_fact = True
             elif body.startswith("Binary files ") and body.endswith(" differ"):
-                marker_old, marker_new = _parse_binary_paths(body)
+                if binary_paths is not None:
+                    raise _MalformedDiff
+                binary_paths = _parse_binary_paths(body)
                 binary = True
                 recognized_fact = True
             elif body == "GIT binary patch":
@@ -330,9 +353,32 @@ class _UnifiedDiffParser:
 
         if not recognized_fact:
             raise _MalformedDiff
+        if new_file and deleted_file:
+            raise _MalformedDiff
+        if (new_file or deleted_file) and renamed:
+            raise _MalformedDiff
+        if binary_paths is not None:
+            binary_old, binary_new = binary_paths
+            if binary_old is not None and binary_old != header_old:
+                raise _MalformedDiff
+            if binary_new is not None and binary_new != header_new:
+                raise _MalformedDiff
+            if (new_file and binary_old is not None) or (
+                deleted_file and binary_new is not None
+            ):
+                raise _MalformedDiff
+            if (new_file and binary_new is None) or (
+                deleted_file and binary_old is None
+            ):
+                raise _MalformedDiff
+            marker_old, marker_new = binary_paths
         if new_file:
+            if has_markers and marker_old is not None:
+                raise _MalformedDiff
             marker_old = None
         if deleted_file:
+            if has_markers and marker_new is not None:
+                raise _MalformedDiff
             marker_new = None
         if rename_old is not None and rename_old != header_old:
             raise _MalformedDiff
@@ -407,6 +453,8 @@ class _UnifiedDiffParser:
         old_count = int(match.group(2) or "1")
         new_start = int(match.group(3))
         new_count = int(match.group(4) or "1")
+        if (old_count > 0 and old_start == 0) or (new_count > 0 and new_start == 0):
+            raise _MalformedDiff
         old_seen = 0
         new_seen = 0
         old_line = old_start

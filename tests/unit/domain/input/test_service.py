@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -392,7 +393,7 @@ def test_change_set_rejects_mismatched_completeness_proof(
         .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
         .change_set
     )
-    forged_proof = replace(change_set.completeness, **proof_updates)
+    forged_proof = replace(change_set.completeness, **cast(Any, proof_updates))
 
     with pytest.raises(ValueError):
         replace(change_set, completeness=forged_proof)
@@ -431,7 +432,7 @@ def test_normalized_input_rejects_mismatched_binding(
     result = make_service().normalize_plain_diff(
         task_id="task-1", text=fixture("basic.diff")
     )
-    forged_binding = replace(result.binding, **binding_updates)
+    forged_binding = replace(result.binding, **cast(Any, binding_updates))
 
     with pytest.raises(ValueError):
         NormalizedInput(change_set=result.change_set, binding=forged_binding)

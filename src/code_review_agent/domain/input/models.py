@@ -174,6 +174,20 @@ class Hunk:
             raise ValueError("hunk identity and ranges must be valid")
         if not _SHA256.fullmatch(self.content_digest):
             raise ValueError("hunk digest must be lowercase SHA-256")
+        if (self.old_count > 0 and self.old_start == 0) or (
+            self.new_count > 0 and self.new_start == 0
+        ):
+            raise ValueError("non-empty hunk ranges require positive starts")
+        old_line_count = sum(
+            line.line_type in (LineType.CONTEXT, LineType.DELETION)
+            for line in self.lines
+        )
+        new_line_count = sum(
+            line.line_type in (LineType.CONTEXT, LineType.ADDITION)
+            for line in self.lines
+        )
+        if old_line_count != self.old_count or new_line_count != self.new_count:
+            raise ValueError("hunk line counts do not match its ranges")
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +212,21 @@ class ChangedFile:
             raise ValueError("binary flag and change type must agree")
         if self.is_binary and self.unreviewable_reason != "binary_content":
             raise ValueError("binary files must state why they are unreviewable")
+        if self.is_binary and self.hunks:
+            raise ValueError("binary files cannot contain text hunks")
+        additions = sum(
+            line.line_type is LineType.ADDITION
+            for hunk in self.hunks
+            for line in hunk.lines
+        )
+        deletions = sum(
+            line.line_type is LineType.DELETION
+            for hunk in self.hunks
+            for line in hunk.lines
+        )
+        if self.additions != additions or self.deletions != deletions:
+            raise ValueError("file statistics do not match hunk lines")
+        _validate_hunk_order(self.hunks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +280,21 @@ class CompletenessProof:
         if self.status is not CompletenessStatus.COMPLETE:
             raise ValueError("only complete input can form a completeness proof")
         if (
+            not _SHA256.fullmatch(self.input_identity_digest)
+            or not _SHA256.fullmatch(self.fixed_version)
+            or not _SHA256.fullmatch(self.change_set_digest)
+        ):
+            raise ValueError("completeness digests must be lowercase SHA-256")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.provider_id,
+                self.provider_version,
+                self.normalization_version,
+            )
+        ):
+            raise ValueError("completeness versions must be non-empty")
+        if (
             self.acquisition_attempts <= 0
             or min(self.byte_count, self.file_count, self.changed_line_count) < 0
         ):
@@ -259,6 +303,14 @@ class CompletenessProof:
             raise ValueError("complete input must have consistent counts")
         if self.truncated or self.folded or self.overflowed or self.version_drifted:
             raise ValueError("incomplete input cannot be marked complete")
+        if (
+            self.byte_count > self.limits.max_bytes
+            or self.file_count > self.limits.max_files
+            or self.changed_line_count > self.limits.max_changed_lines
+        ):
+            raise ValueError("completeness statistics exceed input limits")
+        if len(set(self.binary_file_ids)) != len(self.binary_file_ids):
+            raise ValueError("binary file identities must be unique")
         digest = sha256_digest(
             {
                 "status": self.status.value,
@@ -320,8 +372,53 @@ class ChangeSet:
         )
         if self.changed_line_count != actual_changed_lines:
             raise ValueError("change set line count mismatch")
+        if self.byte_count < 0:
+            raise ValueError("change set byte count must be non-negative")
         if self.completeness.change_set_digest != self.change_set_digest:
             raise ValueError("completeness proof does not bind the change set")
+        proof = self.completeness
+        if (
+            proof.input_identity_digest != self.identity.identity_digest
+            or proof.provider_id != self.identity.provider_id
+            or proof.provider_version != self.identity.provider_version
+            or proof.fixed_version != self.identity.content_digest
+            or proof.normalization_version != self.normalization_version
+            or self.schema_version != self.identity.schema_version
+        ):
+            raise ValueError("completeness proof identity mismatch")
+        if (
+            proof.byte_count != self.byte_count
+            or proof.file_count != self.file_count
+            or proof.changed_line_count != self.changed_line_count
+            or proof.limits != self.limits
+        ):
+            raise ValueError("completeness proof statistics mismatch")
+        file_ids = tuple(changed_file.file_id for changed_file in self.files)
+        if len(set(file_ids)) != len(file_ids):
+            raise ValueError("change set file identities must be unique")
+        covered_ids = (
+            self.coverage.reviewable_file_ids
+            + self.coverage.unreviewable_file_ids
+            + self.coverage.safely_skipped_file_ids
+        )
+        if set(covered_ids) != set(file_ids):
+            raise ValueError("coverage must classify every changed file exactly once")
+        expected_unreviewable = {
+            changed_file.file_id
+            for changed_file in self.files
+            if changed_file.is_binary
+        }
+        if set(self.coverage.unreviewable_file_ids) != expected_unreviewable:
+            raise ValueError("coverage does not match unreviewable files")
+        if set(proof.binary_file_ids) != expected_unreviewable:
+            raise ValueError("completeness proof does not match binary files")
+        expected_reviewable = (
+            set(file_ids)
+            - expected_unreviewable
+            - set(self.coverage.safely_skipped_file_ids)
+        )
+        if set(self.coverage.reviewable_file_ids) != expected_reviewable:
+            raise ValueError("coverage does not match reviewable files")
         object.__setattr__(self, "created_at", ensure_utc(self.created_at))
 
 
@@ -338,3 +435,32 @@ class NormalizedInput:
             != self.change_set.completeness.proof_digest
         ):
             raise ValueError("input binding completeness mismatch")
+        expected_ref = (
+            f"{self.change_set.change_set_id}:{self.change_set.change_set_digest}"
+        )
+        if (
+            self.binding.input_type != self.change_set.identity.input_type
+            or self.binding.object_identity != self.change_set.identity.identity_digest
+            or self.binding.changeset_ref != expected_ref
+        ):
+            raise ValueError("input binding identity mismatch")
+        if self.binding.base_sha is not None or self.binding.head_sha is not None:
+            raise ValueError("plain diff binding cannot contain commit SHAs")
+        if self.change_set.sanitized_diff_ref.task_id != self.binding.task_id:
+            raise ValueError("input binding task mismatch")
+
+
+def _validate_hunk_order(hunks: tuple[Hunk, ...]) -> None:
+    previous: Hunk | None = None
+    for hunk in hunks:
+        if previous is not None:
+            previous_old_end = previous.old_start + previous.old_count
+            previous_new_end = previous.new_start + previous.new_count
+            if (
+                hunk.old_start < previous_old_end
+                or hunk.new_start < previous_new_end
+                or hunk.old_start < previous.old_start
+                or hunk.new_start < previous.new_start
+            ):
+                raise ValueError("hunks must be ordered and non-overlapping")
+        previous = hunk

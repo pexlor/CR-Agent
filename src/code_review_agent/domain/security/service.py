@@ -189,7 +189,7 @@ class SecurityService:
             original_digest=sha256_bytes(original_payload.encode("utf-8"))
             if original_payload
             else sha256_bytes(b""),
-            sanitized_digest=sha256_bytes(payload.encode("utf-8")) if payload else "",
+            sanitized_digest=sha256_bytes(payload.encode("utf-8")),
             categories=categories,
             provenance=descriptor.provenance,
         )
