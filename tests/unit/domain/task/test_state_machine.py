@@ -1,7 +1,10 @@
 import pytest
 
 from code_review_agent.domain.task.models import ControlState, Phase
-from code_review_agent.domain.task.state_machine import advance_phase, validate_control_transition
+from code_review_agent.domain.task.state_machine import (
+    advance_phase,
+    validate_control_transition,
+)
 
 
 def test_phase_only_moves_forward() -> None:

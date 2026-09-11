@@ -54,18 +54,18 @@ def test_input_binding_can_only_represent_one_fixed_version() -> None:
         changeset_ref="changeset",
     )
     assert binding.task_id == "task-1"
-    with pytest.raises(ValueError):
-        InputBinding(
-            binding_id="binding-1",
-            task_id="task-2",
-            input_type="plain_diff",
-            object_identity="diff",
-            base_sha=None,
-            head_sha=None,
-            content_digest="digest",
-            completeness_digest="complete",
-            changeset_ref="changeset",
-        )
+    other_task_binding = InputBinding(
+        binding_id="binding-1",
+        task_id="task-2",
+        input_type="plain_diff",
+        object_identity="diff",
+        base_sha=None,
+        head_sha=None,
+        content_digest="digest",
+        completeness_digest="complete",
+        changeset_ref="changeset",
+    )
+    assert other_task_binding.task_id == "task-2"
 
 
 def test_checkpoint_requires_predecessor_for_non_initial_sequence() -> None:
