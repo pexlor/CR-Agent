@@ -431,6 +431,7 @@ async def test_gateway_rejects_request_not_issued_by_its_prepare() -> None:
 
     assert caught.value.code == "model_capability_mismatch"
     assert provider.send_calls == 0
+    assert provider.active_prepare_count == 0
 
 
 @pytest.mark.asyncio
@@ -460,6 +461,7 @@ async def test_gateway_revalidates_fixed_request_before_send(
 
     assert caught.value.code == "model_capability_mismatch"
     assert provider.send_calls == 0
+    assert provider.active_prepare_count == 0
 
 
 @pytest.mark.asyncio
@@ -822,6 +824,29 @@ async def test_invalid_provider_return_becomes_unknown_and_settles_reservation()
     assert outcome.error_code == "model_result_unknown"
     assert "secret" not in repr(outcome)
     assert provider.active_prepare_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mutated_provider_result_becomes_unknown() -> None:
+    result = ProviderSendResult(
+        provider_state=ProviderState.SUCCEEDED,
+        request_sent=True,
+        response_payload={"findings": []},
+        usage=ModelUsage(UsageState.KNOWN, 1, 1),
+    )
+    object.__setattr__(result, "provider_state", "succeeded")
+    provider = FakeModelProvider(capabilities(), (result,))
+    gateway = ModelGateway()
+    prepared = gateway.prepare(
+        provider, envelope(), options(StructuredOutputStrategy.JSON_SCHEMA)
+    )
+    reservation = reservation_for(prepared)
+
+    outcome = await gateway.send(provider, prepared, reservation=reservation)
+
+    assert outcome.state.provider_state is ProviderState.UNKNOWN
+    assert outcome.reservation_action is ReservationAction.SETTLE_UNCERTAIN
+    assert outcome.accounted_tokens == reservation.amount
 
 
 @pytest.mark.asyncio
