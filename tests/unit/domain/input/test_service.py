@@ -192,6 +192,23 @@ def test_deleted_binary_uses_dev_null_without_changing_header_path() -> None:
 @pytest.mark.parametrize(
     "binary_line",
     [
+        "Binary files /dev/null and b/image.bin differ",
+        "Binary files a/image.bin and /dev/null differ",
+    ],
+)
+def test_binary_dev_null_requires_matching_file_mode(binary_line: str) -> None:
+    content = f"diff --git a/image.bin b/image.bin\n{binary_line}\n"
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "binary_line",
+    [
         "Binary files a/other.bin and b/image.bin differ",
         "Binary files a/image.bin and b/other.bin differ",
         "Binary files /dev/null and b/other.bin differ",
@@ -397,6 +414,22 @@ def test_change_set_rejects_mismatched_completeness_proof(
 
     with pytest.raises(ValueError):
         replace(change_set, completeness=forged_proof)
+
+
+def test_change_set_normalization_must_also_match_input_identity() -> None:
+    change_set = (
+        make_service()
+        .normalize_plain_diff(task_id="task-1", text=fixture("basic.diff"))
+        .change_set
+    )
+    forged_proof = replace(change_set.completeness, normalization_version="v2")
+
+    with pytest.raises(ValueError):
+        replace(
+            change_set,
+            completeness=forged_proof,
+            normalization_version="v2",
+        )
 
 
 def test_change_set_coverage_must_exactly_classify_every_file() -> None:
