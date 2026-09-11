@@ -1,0 +1,21 @@
+[output]
+reports_dir = "reports"
+
+[budget]
+default_tokens = 50000
+max_tokens = 1000000
+
+[provider]
+id = "local"
+version = "1"
+model = "deterministic"
+origin = "https://local.invalid"
+max_output_tokens = 256
+
+[rules]
+id = "default"
+version = "1"
+
+[security]
+policy_id = "code-review-agent-default"
+policy_version = 1

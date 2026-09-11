@@ -48,7 +48,7 @@ def build_commands(
     config: CliConfig | None = None,
 ) -> typer.Typer:
     app = typer.Typer(no_args_is_help=True, add_completion=False)
-    cli_config = config or CliConfig.from_environment()
+    cli_config = config or CliConfig()
 
     @app.command()
     def review(
