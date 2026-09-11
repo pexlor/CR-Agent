@@ -12,9 +12,8 @@ from code_review_agent.domain.budget.models import UsageState as UsageState
 from code_review_agent.domain.common.digests import sha256_bytes
 
 _STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
-_HEADER_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_AUTH_HEADERS = frozenset(
-    {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+_FIXED_HEADER_ALLOWLIST = frozenset(
+    {"accept", "content-type", "anthropic-version", "anthropic-beta"}
 )
 
 
@@ -38,14 +37,8 @@ def _freeze_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
     if not normalized:
         raise ValueError("fixed non-authentication headers are required")
     for name, value in normalized.items():
-        if (
-            not isinstance(name, str)
-            or not _HEADER_NAME.fullmatch(name)
-            or name in _AUTH_HEADERS
-        ):
-            raise ValueError(
-                "prepared headers must be lowercase and non-authentication"
-            )
+        if not isinstance(name, str) or name not in _FIXED_HEADER_ALLOWLIST:
+            raise ValueError("prepared header name is not in the non-auth allowlist")
         if not isinstance(value, str) or not value or "\r" in value or "\n" in value:
             raise ValueError("prepared header values must be fixed safe strings")
     return MappingProxyType(normalized)

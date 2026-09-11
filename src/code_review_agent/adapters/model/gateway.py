@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from code_review_agent.domain.budget.models import UsageState
-from code_review_agent.domain.common.digests import sha256_digest
+from code_review_agent.domain.common.digests import sha256_bytes, sha256_digest
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.execution.models import (
     ModelCallOutcome,
     ModelCallState,
+    ModelCapabilities,
     ModelRequestOptions,
     ModelUsage,
     PreparedModelRequest,
@@ -27,6 +28,8 @@ class _PreparedPermit:
     provider: ModelGatewayPort
     request: PreparedModelRequest
     fingerprint: str
+    capabilities: ModelCapabilities
+    capability_digest: str
 
 
 class ModelGateway:
@@ -50,6 +53,7 @@ class ModelGateway:
             or not capabilities.streaming_disabled
             or not capabilities.retries_disabled
             or not capabilities.dynamic_tools_disabled
+            or not capabilities.preflight_token_counting
             or options.strategy not in capabilities.structured_output_strategies
             or options.max_output_tokens > capabilities.max_output_tokens
         ):
@@ -76,10 +80,13 @@ class ModelGateway:
             provider_owns_request = False
         if not provider_owns_request:
             raise self._capability_error("model_prepare")
+        capability_snapshot = replace(capabilities)
         self._prepared[id(prepared)] = _PreparedPermit(
             provider=provider,
             request=prepared,
             fingerprint=self._request_fingerprint(prepared),
+            capabilities=capability_snapshot,
+            capability_digest=self._capability_fingerprint(capability_snapshot),
         )
         return prepared
 
@@ -97,11 +104,16 @@ class ModelGateway:
             provider_owns_request = provider.owns_prepared_request(request)
         except Exception:
             provider_owns_request = False
+        current_capabilities = provider.capabilities
         if (
             permit is None
             or permit.provider is not provider
             or permit.request is not request
             or permit.fingerprint != self._request_fingerprint(request)
+            or not self._body_digest_matches(request)
+            or current_capabilities != permit.capabilities
+            or self._capability_fingerprint(current_capabilities)
+            != permit.capability_digest
             or not provider_owns_request
             or not self._prepared_request_matches(
                 request,
@@ -115,7 +127,7 @@ class ModelGateway:
             raise self._capability_error("model_send")
 
         del self._prepared[id(request)]
-        usage_mapping_trusted = provider.capabilities.usage_mapping_trusted
+        usage_mapping_trusted = permit.capabilities.usage_mapping_trusted
 
         try:
             result = await provider.send_prepared(request)
@@ -155,6 +167,41 @@ class ModelGateway:
             and request.automatic_retries == 0
             and request.fallback_model_id is None
             and not request.dynamic_tools
+            and capabilities.preflight_token_counting
+            and capabilities.streaming_disabled
+            and capabilities.retries_disabled
+            and capabilities.dynamic_tools_disabled
+        )
+
+    @staticmethod
+    def _body_digest_matches(request: PreparedModelRequest) -> bool:
+        return isinstance(request.body, bytes) and (
+            sha256_bytes(request.body) == request.body_digest
+        )
+
+    @staticmethod
+    def _capability_fingerprint(capabilities: ModelCapabilities) -> str:
+        return sha256_digest(
+            {
+                "context_token_limit": capabilities.context_token_limit,
+                "dynamic_tools_disabled": capabilities.dynamic_tools_disabled,
+                "fixed_headers": dict(capabilities.fixed_headers),
+                "max_output_tokens": capabilities.max_output_tokens,
+                "model_id": capabilities.model_id,
+                "origin": capabilities.origin,
+                "preflight_token_counting": capabilities.preflight_token_counting,
+                "provider_id": capabilities.provider_id,
+                "provider_version": capabilities.provider_version,
+                "request_method": capabilities.request_method,
+                "request_path": capabilities.request_path,
+                "retries_disabled": capabilities.retries_disabled,
+                "streaming_disabled": capabilities.streaming_disabled,
+                "structured_output_strategies": [
+                    strategy.value
+                    for strategy in capabilities.structured_output_strategies
+                ],
+                "usage_mapping_trusted": capabilities.usage_mapping_trusted,
+            }
         )
 
     @staticmethod
