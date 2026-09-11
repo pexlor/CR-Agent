@@ -252,6 +252,16 @@ def test_effective_field_limit_fails_the_whole_attempt_before_output() -> None:
     assert result.evidence == ()
 
 
+def test_field_limit_cannot_be_shorter_than_a_sha256_result_field() -> None:
+    _, declaration = _runtime()
+
+    with pytest.raises(ValueError, match="at least 64"):
+        replace(declaration.limits, max_field_length=63)
+
+    accepted = replace(declaration.limits, max_field_length=64)
+    assert accepted.max_field_length == 64
+
+
 def test_digest_mismatch_marks_determinism_violation_and_disables_version() -> None:
     runtime, declaration = _runtime()
     authorized_input = _authorized_input("eval(user_input)")
