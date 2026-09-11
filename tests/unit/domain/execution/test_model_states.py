@@ -4,10 +4,13 @@ import pytest
 
 from code_review_agent.domain.common.digests import canonical_json
 from code_review_agent.domain.execution.models import (
+    ModelCallOutcome,
     ModelCallState,
     ModelUsage,
     PromptEnvelope,
     ProviderState,
+    ProviderSendResult,
+    ReservationAction,
     ResponseState,
     StructuredOutputStrategy,
     UsageState,
@@ -129,3 +132,81 @@ def test_prompt_envelope_is_deeply_immutable_and_complete() -> None:
     assert isinstance(nested, Mapping)
     with pytest.raises(TypeError):
         nested["extra"] = {}  # type: ignore[index]
+
+
+def test_unsent_known_failure_usage_is_rejected_as_contradictory() -> None:
+    with pytest.raises(ValueError, match="unsent"):
+        ProviderSendResult(
+            provider_state=ProviderState.FAILED_KNOWN,
+            request_sent=False,
+            usage=ModelUsage(UsageState.KNOWN, 1, 1),
+        )
+
+
+def test_provider_and_outcome_payloads_are_deeply_immutable() -> None:
+    provider_payload: dict[str, object] = {
+        "findings": [{"title": "original"}],
+    }
+    provider_result = ProviderSendResult(
+        provider_state=ProviderState.SUCCEEDED,
+        request_sent=True,
+        response_payload=provider_payload,
+        usage=ModelUsage(UsageState.KNOWN, 1, 1),
+    )
+    outcome_payload: dict[str, object] = {
+        "findings": [{"title": "outcome"}],
+    }
+    outcome = ModelCallOutcome(
+        state=ModelCallState(ProviderState.SUCCEEDED, ResponseState.PENDING),
+        reservation_action=ReservationAction.SETTLE_KNOWN,
+        usage=ModelUsage(UsageState.KNOWN, 1, 1),
+        accounted_tokens=2,
+        overage_tokens=0,
+        response_payload=outcome_payload,
+    )
+    provider_snapshot = canonical_json(provider_result.response_payload)
+    outcome_snapshot = canonical_json(outcome.response_payload)
+
+    cast_provider_findings = provider_payload["findings"]
+    assert isinstance(cast_provider_findings, list)
+    cast_provider_findings.append({"title": "mutated"})
+    cast_outcome_findings = outcome_payload["findings"]
+    assert isinstance(cast_outcome_findings, list)
+    cast_outcome_findings.append({"title": "mutated"})
+
+    assert canonical_json(provider_result.response_payload) == provider_snapshot
+    assert canonical_json(outcome.response_payload) == outcome_snapshot
+    assert provider_result.response_payload is not None
+    frozen_findings = provider_result.response_payload["findings"]
+    assert isinstance(frozen_findings, tuple)
+    nested_finding = frozen_findings[0]
+    assert isinstance(nested_finding, Mapping)
+    with pytest.raises(TypeError):
+        nested_finding["title"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ({"findings": {"not-json"}}, {"score": float("nan")}),
+)
+def test_provider_payload_rejects_non_strict_json(
+    payload: Mapping[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ProviderSendResult(
+            provider_state=ProviderState.SUCCEEDED,
+            request_sent=True,
+            response_payload=payload,
+        )
+
+
+def test_model_outcome_payload_rejects_non_strict_json() -> None:
+    with pytest.raises(TypeError):
+        ModelCallOutcome(
+            state=ModelCallState(ProviderState.SUCCEEDED, ResponseState.PENDING),
+            reservation_action=ReservationAction.SETTLE_KNOWN,
+            usage=ModelUsage(UsageState.KNOWN, 1, 1),
+            accounted_tokens=2,
+            overage_tokens=0,
+            response_payload={"findings": {"not-json"}},
+        )
