@@ -207,6 +207,80 @@ def test_binary_dev_null_requires_matching_file_mode(binary_line: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("mode_line", "binary_line"),
+    [
+        ("new file mode not-a-mode", "Binary files /dev/null and b/image.bin differ"),
+        ("new file mode 10064", "Binary files /dev/null and b/image.bin differ"),
+        (
+            "deleted file mode 777777",
+            "Binary files a/image.bin and /dev/null differ",
+        ),
+        (
+            "deleted file mode 100644 trailing",
+            "Binary files a/image.bin and /dev/null differ",
+        ),
+    ],
+)
+def test_binary_dev_null_rejects_invalid_git_file_mode(
+    mode_line: str, binary_line: str
+) -> None:
+    content = f"diff --git a/image.bin b/image.bin\n{mode_line}\n{binary_line}\n"
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("mode_line", "binary_line"),
+    [
+        ("new file mode 100644", "Binary files /dev/null and b/image.bin differ"),
+        (
+            "deleted file mode 100644",
+            "Binary files a/image.bin and /dev/null differ",
+        ),
+    ],
+)
+def test_duplicate_file_mode_declarations_are_rejected(
+    mode_line: str, binary_line: str
+) -> None:
+    content = (
+        f"diff --git a/image.bin b/image.bin\n{mode_line}\n{mode_line}\n{binary_line}\n"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "",
+        "literal 0\nSIMULATED_BINARY_PAYLOAD\n",
+    ],
+)
+def test_git_binary_patch_is_rejected_instead_of_marked_complete(payload: str) -> None:
+    content = (
+        "diff --git a/image.bin b/image.bin\n"
+        "index 1234567..abcdef0 100644\n"
+        "GIT binary patch\n"
+        f"{payload}"
+    )
+
+    with pytest.raises(StableError) as captured:
+        make_service().normalize_plain_diff(task_id="task-1", text=content)
+
+    assert captured.value.code == "input_malformed"
+    assert captured.value.__cause__ is None
+    assert "SIMULATED_BINARY_PAYLOAD" not in str(captured.value.to_dict())
+
+
+@pytest.mark.parametrize(
     "binary_line",
     [
         "Binary files a/other.bin and b/image.bin differ",
