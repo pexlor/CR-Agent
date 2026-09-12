@@ -103,11 +103,17 @@ class ReviewOrchestrator:
         executions: list[Any] = []
         session.advance(SessionPhase.EXECUTING)
         stop_requested = False
+        unknown_execution = False
         for unit in sorted(plan.work_units, key=lambda item: item.execution_rank):
             if dependencies.should_stop():
                 stop_requested = True
                 break
-            executions.append(await dependencies.steps.execute(unit))
+            execution = await dependencies.steps.execute(unit)
+            executions.append(execution)
+            state = getattr(execution, "state", None)
+            if getattr(state, "value", state) == "unknown":
+                unknown_execution = True
+                break
 
         session.advance(SessionPhase.CONSOLIDATING)
         finding_set = dependencies.steps.consolidate(
@@ -121,7 +127,11 @@ class ReviewOrchestrator:
         session.advance(SessionPhase.REPORTING)
         delivery = dependencies.steps.deliver(model, command.output_path)
         session.advance(SessionPhase.COMPLETED)
-        state = str(getattr(snapshot, "result_state", "complete_no_findings"))
+        state = (
+            "unknown"
+            if unknown_execution
+            else str(getattr(snapshot, "result_state", "complete_no_findings"))
+        )
         path = getattr(delivery, "path", command.output_path)
         digest = getattr(delivery, "content_digest", None)
         return ReviewRunResult(
@@ -132,7 +142,13 @@ class ReviewOrchestrator:
             delivery_state="succeeded",
             report_path=path,
             report_digest=digest,
-            limitations=("stop_requested",) if stop_requested else (),
+            limitations=(
+                ("unknown_execution",)
+                if unknown_execution
+                else ("stop_requested",)
+                if stop_requested
+                else ()
+            ),
             trace=session.trace,
         )
 
