@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from stat import S_IRWXG, S_IRWXO
 from urllib.parse import urlparse
@@ -19,7 +19,7 @@ class CliConfig:
     model_id: str = "deterministic"
     provider_origin: str = "https://local.invalid"
     provider_path: str = "/review"
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     timeout_seconds: int = 60
     max_response_bytes: int = 1_048_576
     max_output_tokens: int = 256

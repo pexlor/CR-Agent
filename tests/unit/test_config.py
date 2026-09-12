@@ -54,6 +54,7 @@ def test_openai_compatible_config_loads_provider_fields(tmp_path: Path) -> None:
     assert config.timeout_seconds == 30
     assert config.max_response_bytes == 1_048_576
     assert config.structured_output == "json_object"
+    assert "secret-token" not in repr(config)
 
 
 def test_inline_token_config_rejects_group_or_other_read_access(
@@ -91,4 +92,3 @@ def test_openai_compatible_config_rejects_invalid_transport_fields(
 
     with pytest.raises(ValueError, match=code):
         CliConfig.from_file(path)
-

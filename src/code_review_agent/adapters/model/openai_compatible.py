@@ -154,7 +154,7 @@ class OpenAICompatibleProvider:
             error_code = (
                 "provider_http_5xx"
                 if response.status_code >= 500
-                else "provider_http_429"
+                else f"provider_http_{response.status_code}"
             )
             return _unknown(error_code)
         if response.status_code < 200 or response.status_code >= 300:

@@ -105,6 +105,7 @@ def test_send_maps_successful_response_and_usage() -> None:
     ("status", "state", "code"),
     [
         (401, ProviderState.FAILED_KNOWN, "provider_http_401"),
+        (408, ProviderState.UNKNOWN, "provider_http_408"),
         (429, ProviderState.UNKNOWN, "provider_http_429"),
         (500, ProviderState.UNKNOWN, "provider_http_5xx"),
     ],
