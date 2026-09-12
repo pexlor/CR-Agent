@@ -10,6 +10,9 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
+from code_review_agent.adapters.model.openai_compatible import (
+    OpenAICompatibleProvider,
+)
 from code_review_agent.adapters.output.markdown import MarkdownOutputAdapter
 from code_review_agent.adapters.security.scanner import (
     FixedSecurityScanner,
@@ -162,7 +165,7 @@ class _ConfiguredSteps:
     input_service: InputService
     budget: BudgetService
     budget_account_id: str
-    provider: LocalModelProvider
+    provider: Any
     tool_registry: ToolRegistry
     normalized: Any = None
     diff_text: str = ""
@@ -312,6 +315,10 @@ class ConfiguredRuntime:
         account = budget.create_account(
             command.task_id, budget_tokens, capability_ref="capability-1"
         )
+        if self.config.provider_id == "openai-compatible":
+            model_provider: Any = OpenAICompatibleProvider(self.config)
+        else:
+            model_provider = LocalModelProvider(self.config)
         steps = _ConfiguredSteps(
             config=self.config,
             task_id=command.task_id,
@@ -321,7 +328,7 @@ class ConfiguredRuntime:
             ),
             budget=budget,
             budget_account_id=account.account_id,
-            provider=LocalModelProvider(self.config),
+            provider=model_provider,
             tool_registry=ToolRegistry.from_builtin(),
         )
         return asyncio.run(self.tasks.start(command, ReviewDependencies(steps)))
