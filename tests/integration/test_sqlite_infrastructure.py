@@ -27,13 +27,15 @@ def test_migrations_are_idempotent_and_record_schema_version(tmp_path: Path) -> 
     second = connect_database(database)
     apply_migrations(second)
 
-    migration = second.execute(
-        "SELECT version, name, checksum FROM schema_migrations"
-    ).fetchone()
-    assert migration[0] == 1
-    assert migration[1] == "0001_initial"
-    assert len(migration[2]) == 64
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 1
+    migrations = second.execute(
+        "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    assert [(row[0], row[1]) for row in migrations] == [
+        (1, "0001_initial"),
+        (2, "0002_remote_publications"),
+    ]
+    assert all(len(row[2]) == 64 for row in migrations)
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 2
     assert second.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
     ).fetchone()

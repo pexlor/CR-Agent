@@ -83,6 +83,7 @@ class GitLabInputProvider(RemoteDiffProvider):
                 metadata["diff_refs"]["base_sha"],
                 metadata["diff_refs"]["head_sha"],
                 _gitlab_diff(files),
+                metadata["diff_refs"]["start_sha"],
             ),
         )
 
@@ -104,7 +105,5 @@ def _gitlab_diff(files: list[dict[str, object]]) -> str:
         # GitLab's `diff` field already ends with its own trailing newline;
         # appending another one here produces a spurious blank physical line
         # that the unified-diff parser rejects as malformed.
-        chunks.append(
-            f"diff --git a/{old} b/{new}\n--- a/{old}\n+++ b/{new}\n{diff}"
-        )
+        chunks.append(f"diff --git a/{old} b/{new}\n--- a/{old}\n+++ b/{new}\n{diff}")
     return "".join(chunks)

@@ -248,6 +248,7 @@ class InputService:
             content_digest=acquired.identity.content_digest,
             completeness_digest=completeness.proof_digest,
             changeset_ref=f"{change_set_id}:{change_set_digest}",
+            start_sha=acquired.identity.start_sha,
         )
         return NormalizedInput(change_set=change_set, binding=binding)
 

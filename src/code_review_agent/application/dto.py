@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from code_review_agent.domain.publication.models import PublicationResult
+
 type TraceSummaryScalar = str | int | float | bool | None
 
 
@@ -20,6 +22,7 @@ class StartReviewCommand:
     provider: str = ""
     model: str = ""
     budget_tokens: int = 0
+    publish: bool = False
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -106,6 +109,7 @@ class ReviewProgressView:
     result_state: str
     delivery_state: str
     trace: tuple[TraceEventView, ...]
+    publication_state: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,3 +123,4 @@ class ReviewRunResult:
     report_digest: str | None
     limitations: tuple[str, ...] = ()
     trace: tuple[TraceEventView, ...] = ()
+    publication: PublicationResult | None = None

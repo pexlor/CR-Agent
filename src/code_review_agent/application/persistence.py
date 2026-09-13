@@ -35,6 +35,16 @@ from code_review_agent.domain.budget.models import (
     ReservationState,
     UsageState,
 )
+from code_review_agent.domain.publication.models import (
+    PublicationItem,
+    PublicationItemKind,
+    PublicationItemResult,
+    PublicationPlan,
+    PublicationPosition,
+    PublicationResult,
+    PublicationTarget,
+    aggregate_state,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +158,30 @@ class ReviewStateStore:
                     started_at TEXT NOT NULL,
                     terminal_state TEXT
                 );
+                CREATE TABLE IF NOT EXISTS review_publications (
+                    task_id TEXT PRIMARY KEY,
+                    publication_id TEXT NOT NULL UNIQUE,
+                    snapshot_id TEXT NOT NULL,
+                    snapshot_version INTEGER NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_publication_items (
+                    publication_key TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    remote_id TEXT,
+                    remote_url TEXT,
+                    error_code TEXT,
+                    UNIQUE(task_id, ordinal)
+                );
+                CREATE TABLE IF NOT EXISTS review_publication_leases (
+                    task_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
                 """
             )
             for column, definition in (
@@ -184,6 +218,30 @@ class ReviewStateStore:
                 }
                 for event in result.trace
             ],
+            "publication": (
+                None
+                if result.publication is None
+                else {
+                    "task_id": result.publication.task_id,
+                    "publication_id": result.publication.publication_id,
+                    "state": result.publication.state,
+                    "published": result.publication.published,
+                    "skipped": result.publication.skipped,
+                    "failed": result.publication.failed,
+                    "unknown": result.publication.unknown,
+                    "items": [
+                        {
+                            "publication_key": item.publication_key,
+                            "kind": item.kind,
+                            "state": item.state,
+                            "remote_id": item.remote_id,
+                            "remote_url": item.remote_url,
+                            "error_code": item.error_code,
+                        }
+                        for item in result.publication.items
+                    ],
+                }
+            ),
         }
         with self._connect() as connection:
             connection.execute(
@@ -202,6 +260,21 @@ class ReviewStateStore:
         if row is None:
             raise ValueError("task_not_found")
         payload = json.loads(row[0])
+        publication = payload.get("publication")
+        publication_result = None
+        if publication is not None:
+            publication_result = PublicationResult(
+                task_id=publication["task_id"],
+                publication_id=publication["publication_id"],
+                state=publication["state"],
+                published=int(publication["published"]),
+                skipped=int(publication["skipped"]),
+                failed=int(publication["failed"]),
+                unknown=int(publication["unknown"]),
+                items=tuple(
+                    PublicationItemResult(**item) for item in publication["items"]
+                ),
+            )
         return ReviewRunResult(
             task_id=payload["task_id"],
             session_id=payload["session_id"],
@@ -217,6 +290,7 @@ class ReviewStateStore:
                 TraceEventView(item["sequence"], item["phase"], item["message"])
                 for item in payload["trace"]
             ),
+            publication=publication_result,
         )
 
     def progress(self, task_id: str) -> ReviewProgressView:
@@ -227,6 +301,9 @@ class ReviewStateStore:
             result_state=result.result_state,
             delivery_state=result.delivery_state,
             trace=result.trace,
+            publication_state=(
+                result.publication.state if result.publication is not None else None
+            ),
         )
 
     def save_command(
@@ -346,6 +423,228 @@ class ReviewStateStore:
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                 ),
             )
+
+    def save_publication_plan(self, plan: PublicationPlan) -> None:
+        payload = self._publication_plan_json(plan)
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT plan_json FROM review_publications WHERE task_id = ?",
+                (plan.task_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != payload:
+                    raise ValueError("publication_plan_conflict")
+                return
+            connection.execute(
+                "INSERT INTO review_publications(task_id, publication_id, snapshot_id, "
+                "snapshot_version, plan_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    plan.task_id,
+                    plan.publication_id,
+                    plan.snapshot_id,
+                    plan.snapshot_version,
+                    payload,
+                    now,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO review_publication_items(publication_key, task_id, "
+                "ordinal, kind, state) VALUES (?, ?, ?, ?, 'pending')",
+                [
+                    (item.publication_key, plan.task_id, index, item.kind.value)
+                    for index, item in enumerate(plan.items)
+                ],
+            )
+
+    def publication_plan(self, task_id: str) -> PublicationPlan:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT plan_json FROM review_publications WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("publication_not_found")
+        try:
+            return self._decode_publication_plan(str(row[0]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("publication_plan_corrupt") from exc
+
+    def publication_result(self, task_id: str) -> PublicationResult:
+        plan = self.publication_plan(task_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT publication_key, kind, state, remote_id, remote_url, "
+                "error_code FROM review_publication_items WHERE task_id = ? "
+                "ORDER BY ordinal",
+                (task_id,),
+            ).fetchall()
+        if len(rows) != len(plan.items):
+            raise ValueError("publication_plan_corrupt")
+        items = tuple(
+            PublicationItemResult(
+                publication_key=str(row[0]),
+                kind=str(row[1]),
+                state=str(row[2]),
+                remote_id=str(row[3]) if row[3] is not None else None,
+                remote_url=str(row[4]) if row[4] is not None else None,
+                error_code=str(row[5]) if row[5] is not None else None,
+            )
+            for row in rows
+        )
+        state = aggregate_state(items).value
+        return PublicationResult(
+            task_id=task_id,
+            publication_id=plan.publication_id,
+            state=state,
+            published=sum(item.state == "succeeded" for item in items),
+            skipped=0,
+            failed=sum(item.state == "failed" for item in items),
+            unknown=sum(item.state == "unknown" for item in items),
+            items=items,
+        )
+
+    def update_publication_item(
+        self,
+        task_id: str,
+        publication_key: str,
+        *,
+        state: str,
+        remote_id: str | None = None,
+        remote_url: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        if state not in {"pending", "succeeded", "failed", "unknown"}:
+            raise ValueError("publication_state_invalid")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE review_publication_items SET state = ?, remote_id = ?, "
+                "remote_url = ?, error_code = ? WHERE task_id = ? AND "
+                "publication_key = ?",
+                (state, remote_id, remote_url, error_code, task_id, publication_key),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("publication_item_not_found")
+
+    def acquire_publication_lease(
+        self, task_id: str, owner_id: str, *, seconds: int = 120
+    ) -> bool:
+        now = datetime.now(UTC)
+        expiry = now + timedelta(seconds=seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM review_publication_leases WHERE task_id = ? "
+                "AND expires_at <= ?",
+                (task_id, now.isoformat()),
+            )
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO review_publication_leases"
+                "(task_id, owner_id, expires_at) VALUES (?, ?, ?)",
+                (task_id, owner_id, expiry.isoformat()),
+            )
+            return cursor.rowcount == 1
+
+    def release_publication_lease(self, task_id: str, owner_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM review_publication_leases "
+                "WHERE task_id = ? AND owner_id = ?",
+                (task_id, owner_id),
+            )
+
+    def renew_publication_lease(
+        self, task_id: str, owner_id: str, *, seconds: int = 600
+    ) -> bool:
+        now = datetime.now(UTC)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE review_publication_leases SET expires_at = ? "
+                "WHERE task_id = ? AND owner_id = ? AND expires_at > ?",
+                (
+                    (now + timedelta(seconds=seconds)).isoformat(),
+                    task_id,
+                    owner_id,
+                    now.isoformat(),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _publication_plan_json(plan: PublicationPlan) -> str:
+        target = plan.target
+        return json.dumps(
+            {
+                "publication_id": plan.publication_id,
+                "task_id": plan.task_id,
+                "snapshot_id": plan.snapshot_id,
+                "snapshot_version": plan.snapshot_version,
+                "target": {
+                    "platform": target.platform,
+                    "source_url": target.source_url,
+                    "repository": target.repository,
+                    "number": target.number,
+                    "base_sha": target.base_sha,
+                    "start_sha": target.start_sha,
+                    "head_sha": target.head_sha,
+                },
+                "items": [
+                    {
+                        "publication_key": item.publication_key,
+                        "kind": item.kind.value,
+                        "body": item.body,
+                        "body_digest": item.body_digest,
+                        "marker": item.marker,
+                        "finding_id": item.finding_id,
+                        "position": None
+                        if item.position is None
+                        else {
+                            "path": item.position.path,
+                            "old_path": item.position.old_path,
+                            "new_path": item.position.new_path,
+                            "line": item.position.line,
+                            "side": item.position.side,
+                        },
+                    }
+                    for item in plan.items
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _decode_publication_plan(payload: str) -> PublicationPlan:
+        raw = json.loads(payload)
+        target = PublicationTarget(**raw["target"])
+        items = []
+        for value in raw["items"]:
+            position = (
+                PublicationPosition(**value["position"])
+                if value["position"] is not None
+                else None
+            )
+            items.append(
+                PublicationItem(
+                    publication_key=value["publication_key"],
+                    kind=PublicationItemKind(value["kind"]),
+                    body=value["body"],
+                    body_digest=value["body_digest"],
+                    marker=value["marker"],
+                    finding_id=value["finding_id"],
+                    position=position,
+                )
+            )
+        return PublicationPlan(
+            publication_id=raw["publication_id"],
+            task_id=raw["task_id"],
+            snapshot_id=raw["snapshot_id"],
+            snapshot_version=int(raw["snapshot_version"]),
+            target=target,
+            items=tuple(items),
+        )
 
     def load_budget_state(
         self, task_id: str
@@ -789,6 +1088,7 @@ class ReviewStateStore:
             report_digest=result.report_digest,
             limitations=tuple((*result.limitations, "terminated")),
             trace=result.trace,
+            publication=result.publication,
         )
         self.save(updated)
         return updated
@@ -796,6 +1096,15 @@ class ReviewStateStore:
     def cleanup(self, task_id: str) -> None:
         self.get(task_id)
         with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM review_publication_leases WHERE task_id = ?", (task_id,)
+            )
+            connection.execute(
+                "DELETE FROM review_publication_items WHERE task_id = ?", (task_id,)
+            )
+            connection.execute(
+                "DELETE FROM review_publications WHERE task_id = ?", (task_id,)
+            )
             self._delete_task_trace(connection, task_id)
             connection.execute("DELETE FROM review_runs WHERE task_id = ?", (task_id,))
             connection.execute(

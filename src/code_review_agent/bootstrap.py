@@ -16,6 +16,8 @@ from code_review_agent.adapters.model.openai_compatible import (
     OpenAICompatibleProvider,
 )
 from code_review_agent.adapters.output.markdown import MarkdownOutputAdapter
+from code_review_agent.adapters.publication.github import GitHubPublisher
+from code_review_agent.adapters.publication.gitlab import GitLabPublisher
 from code_review_agent.adapters.registry import InputRegistry, ModelRegistry
 from code_review_agent.adapters.security.scanner import (
     FixedSecurityScanner,
@@ -36,6 +38,7 @@ from code_review_agent.application.orchestration import (
     ReviewOrchestrator,
 )
 from code_review_agent.application.persistence import ReviewStateStore
+from code_review_agent.application.publication_service import PublicationService
 from code_review_agent.application.task_service import LocalDiffReviewService
 from code_review_agent.config import CliConfig
 from code_review_agent.domain.budget.models import UsageState as BudgetUsageState
@@ -68,9 +71,18 @@ from code_review_agent.domain.planning.models import (
     PlanningStrategy,
 )
 from code_review_agent.domain.planning.planner import PlanningRequest, ReviewPlanner
+from code_review_agent.domain.publication.models import PublicationResult
+from code_review_agent.domain.publication.planner import PublicationPlanner
 from code_review_agent.domain.report.builder import ReportBuilder
 from code_review_agent.domain.report.models import ResultSnapshot, ResultSnapshotKind
-from code_review_agent.domain.security.models import ArtifactPurpose
+from code_review_agent.domain.security.models import (
+    ArtifactDescriptor,
+    ArtifactKind,
+    ArtifactPurpose,
+    ArtifactSource,
+    SecurityDecision,
+    TrustLabel,
+)
 from code_review_agent.domain.security.service import SecurityService
 from code_review_agent.domain.task.models import TaskSpec
 
@@ -103,6 +115,8 @@ class CliRuntime(Protocol):
     ) -> ReviewRunResult: ...
 
     def providers(self) -> tuple[dict[str, str], ...]: ...
+
+    def publish(self, task_id: str) -> PublicationResult: ...
 
 
 class LocalModelProvider:
@@ -194,6 +208,7 @@ class _ConfiguredSteps:
     input_registry: InputRegistry[Any]
     trace_store: ReviewStateStore
     normalized: Any = None
+    latest_snapshot: ResultSnapshot | None = None
     diff_text: str = ""
     trace_persistence_failed: bool = False
 
@@ -588,7 +603,7 @@ class _ConfiguredSteps:
             )
         if self.trace_persistence_failed:
             result_state = "partial"
-        return ResultSnapshot(
+        snapshot = ResultSnapshot(
             snapshot_id=f"snapshot-{self.task_id}",
             task_id=self.task_id,
             snapshot_version=1,
@@ -607,6 +622,8 @@ class _ConfiguredSteps:
                 "trace_persistence_failed" if self.trace_persistence_failed else None
             ),
         )
+        self.latest_snapshot = snapshot
+        return snapshot
 
     def report(self, snapshot: ResultSnapshot) -> Any:
         self._trace(
@@ -689,6 +706,22 @@ class ConfiguredRuntime:
                 ),
             )
             self.store.save(result)
+        if command.source_url is not None:
+            if steps.normalized is None or steps.latest_snapshot is None:
+                raise ValueError("publication_snapshot_not_ready")
+            plan = PublicationPlanner().plan(
+                command.source_url, steps.normalized, steps.latest_snapshot
+            )
+            publications = self._publication_service(security)
+            publications.prepare(plan)
+            if command.publish:
+                result = replace(
+                    result,
+                    publication=publications.publish(
+                        command.task_id, self._publisher(plan.target.platform)
+                    ),
+                )
+                self.store.save(result)
         return result
 
     def status(self, task_id: str) -> ReviewProgressView:
@@ -810,6 +843,50 @@ class ConfiguredRuntime:
                 for provider_id, version in self.model_registry.list()
             ),
         )
+
+    def publish(self, task_id: str) -> PublicationResult:
+        publications = self._publication_service(self._new_security_service())
+        try:
+            plan = self.store.publication_plan(task_id)
+        except ValueError as exc:
+            if str(exc) != "publication_not_found":
+                raise
+            command, _, _, _ = self.store.command(task_id)
+            raise ValueError(
+                "publication_not_remote_input"
+                if command.source_url is None
+                else "publication_snapshot_not_ready"
+            ) from None
+        result = publications.publish(task_id, self._publisher(plan.target.platform))
+        review = self.tasks.get(task_id)
+        self.store.save(replace(review, publication=result))
+        return result
+
+    def _publisher(self, platform: str) -> Any:
+        credentials = KeyringCredentialStore()
+        if platform == "github":
+            return GitHubPublisher(credentials)
+        if platform == "gitlab":
+            return GitLabPublisher(credentials)
+        raise ValueError("publication_target_invalid")
+
+    def _publication_service(self, security: SecurityService) -> PublicationService:
+        def scan(body: str, task_id: str) -> None:
+            descriptor = ArtifactDescriptor(
+                artifact_id="publication-" + sha256_bytes(body.encode()),
+                task_id=task_id,
+                source=ArtifactSource.TRUSTED_APPLICATION,
+                trust_label=TrustLabel.UNTRUSTED_TEXT,
+                kind=ArtifactKind.REPORT_PAYLOAD,
+                purpose=ArtifactPurpose.REPORT_DELIVERY,
+                provenance=("remote-publication",),
+                max_size=262_144,
+            )
+            prepared = security.evaluate_artifact(body, descriptor)
+            if prepared.decision is not SecurityDecision.SAFE:
+                raise ValueError("publication_content_rejected")
+
+        return PublicationService(self.store, scan=scan)
 
     def _create_model_provider(self) -> Any:
         if self.config.provider_id == "openai-compatible":

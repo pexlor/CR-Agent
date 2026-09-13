@@ -11,7 +11,12 @@ import typer
 
 from code_review_agent.application.dto import StartReviewCommand
 from code_review_agent.bootstrap import CliRuntime
-from code_review_agent.cli.exit_codes import INTERNAL_ERROR, NOT_FOUND, USAGE_ERROR
+from code_review_agent.cli.exit_codes import (
+    DELIVERY_FAILURE,
+    INTERNAL_ERROR,
+    NOT_FOUND,
+    USAGE_ERROR,
+)
 from code_review_agent.cli.presenters import human_result, human_trace, json_envelope
 from code_review_agent.config import CliConfig
 
@@ -60,6 +65,7 @@ def build_commands(
         no_color: bool = typer.Option(False, "--no-color"),  # noqa: B008
         verbose: bool = typer.Option(False, "--verbose"),  # noqa: B008
         request_id: str | None = typer.Option(None, "--request-id"),  # noqa: B008
+        publish: bool = typer.Option(False, "--publish"),  # noqa: B008
     ) -> None:
         del no_color, verbose
         source_count = sum(value is not None for value in (diff_file, url)) + stdin
@@ -68,6 +74,9 @@ def build_commands(
             source_count = 1
         if source_count != 1:
             typer.echo("exactly one input source is required", err=True)
+            raise typer.Exit(USAGE_ERROR)
+        if publish and url is None:
+            typer.echo("--publish requires --url", err=True)
             raise typer.Exit(USAGE_ERROR)
         source_url = _valid_url(url) if url is not None else None
         diff_text = sys.stdin.read() if stdin else None
@@ -78,6 +87,7 @@ def build_commands(
             diff_file=diff_file,
             output_path=cli_config.reports_dir / f"{task_id}.md",
             source_url=source_url,
+            publish=publish,
         )
         rid = _request_id(request_id)
         try:
@@ -89,6 +99,31 @@ def build_commands(
             typer.echo(json_envelope("review", rid, result))
         else:
             typer.echo(human_result(result))
+        if result.publication is not None and result.publication.state != "succeeded":
+            raise typer.Exit(DELIVERY_FAILURE)
+
+    @app.command("publish")
+    def publish_review(
+        task_id: str,
+        confirm: bool = typer.Option(False, "--confirm"),  # noqa: B008
+        json_output: bool = typer.Option(False, "--json"),  # noqa: B008
+        request_id: str | None = typer.Option(None, "--request-id"),  # noqa: B008
+    ) -> None:
+        if not confirm:
+            typer.echo("--confirm is required", err=True)
+            raise typer.Exit(USAGE_ERROR)
+        rid = _request_id(request_id)
+        try:
+            result = runtime_factory().publish(task_id)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(NOT_FOUND) from exc
+        if json_output:
+            typer.echo(json_envelope("publish", rid, result))
+        else:
+            typer.echo(human_result(result))
+        if result.state != "succeeded":
+            raise typer.Exit(DELIVERY_FAILURE)
 
     @app.command()
     def status(

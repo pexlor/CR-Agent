@@ -111,7 +111,11 @@ def test_gitlab_provider_rejects_collapsed_diffs() -> None:
             200,
             json={
                 "state": "opened",
-                "diff_refs": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "diff_refs": {
+                    "base_sha": "a" * 40,
+                    "start_sha": "c" * 40,
+                    "head_sha": "b" * 40,
+                },
             },
         )
     )
@@ -147,7 +151,11 @@ def test_gitlab_provider_parses_the_real_bare_array_diffs_response() -> None:
             200,
             json={
                 "state": "opened",
-                "diff_refs": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "diff_refs": {
+                    "base_sha": "a" * 40,
+                    "start_sha": "c" * 40,
+                    "head_sha": "b" * 40,
+                },
             },
         )
     )
@@ -172,5 +180,5 @@ def test_gitlab_provider_parses_the_real_bare_array_diffs_response() -> None:
     )
 
     assert acquired.identity.base_sha == "a" * 40
+    assert acquired.identity.start_sha == "c" * 40
     assert acquired.identity.head_sha == "b" * 40
-

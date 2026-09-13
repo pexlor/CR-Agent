@@ -48,22 +48,32 @@ def json_envelope(command: str, request_id: str, data: Any) -> str:
 
 
 def human_result(data: Any) -> str:
+    if hasattr(data, "publication_id"):
+        return (
+            f"task_id={data.task_id} publication={data.state} "
+            f"published={data.published} skipped={data.skipped} "
+            f"failed={data.failed} unknown={data.unknown}"
+        )
     if hasattr(data, "report_path"):
+        publication = ""
+        if getattr(data, "publication", None) is not None:
+            publication = f" publication={data.publication.state}"
         return (
             f"task_id={data.task_id} result={data.result_state} "
-            f"delivery={data.delivery_state} report={data.report_path}"
+            f"delivery={data.delivery_state} report={data.report_path}{publication}"
         )
     if hasattr(data, "task_id"):
+        publication = ""
+        if getattr(data, "publication_state", None) is not None:
+            publication = f" publication={data.publication_state}"
         return (
             f"task_id={data.task_id} phase={data.phase} "
-            f"result={data.result_state} delivery={data.delivery_state}"
+            f"result={data.result_state} delivery={data.delivery_state}{publication}"
         )
     return str(data)
 
 
-def human_trace(
-    trace_id: str, events: tuple[object, ...]
-) -> str:
+def human_trace(trace_id: str, events: tuple[object, ...]) -> str:
     lines: list[str] = []
     for event in events:
         if isinstance(event, PersistedTraceEventView):

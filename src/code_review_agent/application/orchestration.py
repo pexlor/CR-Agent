@@ -257,4 +257,7 @@ class ReviewOrchestrator:
             result_state=result.result_state,
             delivery_state=result.delivery_state,
             trace=tuple(trace),
+            publication_state=(
+                result.publication.state if result.publication is not None else None
+            ),
         )
