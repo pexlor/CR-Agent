@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 @dataclass(frozen=True, slots=True)
 class CliConfig:
     reports_dir: Path = Path("reports")
+    state_database: Path = Path("state/reviews.sqlite3")
     default_budget_tokens: int = 50_000
     max_budget_tokens: int = 1_000_000
     provider_id: str = "local"
@@ -42,6 +43,7 @@ class CliConfig:
         security = data.get("security", {})
         result = cls(
             reports_dir=Path(output.get("reports_dir", "reports")),
+            state_database=Path(output.get("state_database", "state/reviews.sqlite3")),
             default_budget_tokens=budget.get("default_tokens", 50_000),
             max_budget_tokens=budget.get("max_tokens", 1_000_000),
             provider_id=provider.get("id", "local"),
@@ -56,9 +58,7 @@ class CliConfig:
             structured_output=provider.get("structured_output", "json_object"),
             ruleset_id=rules.get("id", "default"),
             ruleset_version=rules.get("version", "1"),
-            security_policy_id=security.get(
-                "policy_id", "code-review-agent-default"
-            ),
+            security_policy_id=security.get("policy_id", "code-review-agent-default"),
             security_policy_version=security.get("policy_version", 1),
         )
         if not 1 <= result.default_budget_tokens <= result.max_budget_tokens:
@@ -93,10 +93,7 @@ class CliConfig:
             raise ValueError("config_missing_api_key")
         if type(config.timeout_seconds) is not int or config.timeout_seconds <= 0:
             raise ValueError("config_invalid_timeout")
-        if (
-            type(config.max_response_bytes) is not int
-            or config.max_response_bytes <= 0
-        ):
+        if type(config.max_response_bytes) is not int or config.max_response_bytes <= 0:
             raise ValueError("config_invalid_response_limit")
         if config.structured_output != "json_object":
             raise ValueError("config_invalid_structured_output")

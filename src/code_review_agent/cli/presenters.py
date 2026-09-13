@@ -13,17 +13,14 @@ def _json_value(value: Any) -> Any:
         return str(value)
     if is_dataclass(value):
         return {
-            key: _json_value(item)
-            for key, item in asdict(cast(Any, value)).items()
+            key: _json_value(item) for key, item in asdict(cast(Any, value)).items()
         }
     if isinstance(value, tuple):
         return [_json_value(item) for item in value]
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     if hasattr(value, "__dict__"):
-        return {
-            str(key): _json_value(item) for key, item in vars(value).items()
-        }
+        return {str(key): _json_value(item) for key, item in vars(value).items()}
     return value
 
 
@@ -58,6 +55,4 @@ def human_result(data: Any) -> str:
 
 
 def human_trace(trace_id: str, events: tuple[Any, ...]) -> str:
-    return "\n".join(
-        f"{trace_id} [{event.phase}] {event.message}" for event in events
-    )
+    return "\n".join(f"{trace_id} [{event.phase}] {event.message}" for event in events)

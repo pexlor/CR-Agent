@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -81,9 +82,7 @@ def test_send_maps_successful_response_and_usage() -> None:
         return_value=httpx.Response(
             200,
             json={
-                "choices": [
-                    {"message": {"content": '{"findings": []}'}}
-                ],
+                "choices": [{"message": {"content": '{"findings": []}'}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5},
             },
         )
@@ -99,6 +98,24 @@ def test_send_maps_successful_response_and_usage() -> None:
     assert result.usage.state is UsageState.KNOWN
     assert result.usage.reported_total == 15
     assert not provider.owns_prepared_request(request)
+
+
+def test_send_disables_environment_proxy_inheritance() -> None:
+    provider = OpenAICompatibleProvider(_config())
+    request = _prepare(provider)
+
+    with patch("httpx.AsyncClient", wraps=httpx.AsyncClient) as client, respx.mock:
+        respx.post("https://api.example.com/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": '{"findings": []}'}}],
+                },
+            )
+        )
+        asyncio.run(provider.send_prepared(request))
+
+    assert client.call_args.kwargs["trust_env"] is False
 
 
 @pytest.mark.parametrize(

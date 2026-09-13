@@ -25,6 +25,7 @@ PLAIN_DIFF_PROVIDER_ID = "plain_diff"
 PLAIN_DIFF_PROVIDER_VERSION = "1"
 NORMALIZATION_VERSION = "plain_diff_utf8_lf_v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 class ChangeType(StrEnum):
@@ -79,12 +80,16 @@ class InputIdentity:
     content_digest: str
     digest_algorithm: str
     normalization_version: str
+    repository_identity: str | None = None
+    object_number: int | None = None
+    base_sha: str | None = None
+    head_sha: str | None = None
     identity_digest: str = field(init=False)
     display_name: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.input_type != PLAIN_DIFF_PROVIDER_ID:
-            raise ValueError("unsupported input identity type")
+        if not self.input_type or not self.provider_id or not self.provider_version:
+            raise ValueError("input identity fields are required")
         if not _SHA256.fullmatch(self.content_digest):
             raise ValueError("content digest must be lowercase SHA-256")
         if self.digest_algorithm != "sha256":
@@ -98,10 +103,19 @@ class InputIdentity:
                 "content_digest": self.content_digest,
                 "digest_algorithm": self.digest_algorithm,
                 "normalization_version": self.normalization_version,
+                "repository_identity": self.repository_identity,
+                "object_number": self.object_number,
+                "base_sha": self.base_sha,
+                "head_sha": self.head_sha,
             }
         )
         object.__setattr__(self, "identity_digest", digest)
-        object.__setattr__(self, "display_name", f"plain diff {digest[:12]}")
+        display_name = (
+            f"plain diff {digest[:12]}"
+            if self.input_type == PLAIN_DIFF_PROVIDER_ID
+            else f"{self.provider_id} {self.object_number}"
+        )
+        object.__setattr__(self, "display_name", display_name)
 
     @classmethod
     def for_plain_diff(cls, content_digest: str) -> InputIdentity:
@@ -113,6 +127,33 @@ class InputIdentity:
             content_digest=content_digest,
             digest_algorithm="sha256",
             normalization_version=NORMALIZATION_VERSION,
+        )
+
+    @classmethod
+    def for_remote_change(
+        cls,
+        *,
+        provider_id: str,
+        provider_version: str,
+        repository_identity: str,
+        object_number: int,
+        base_sha: str,
+        head_sha: str,
+        content_digest: str,
+        normalization_version: str = "remote_unified_diff_utf8_lf_v1",
+    ) -> InputIdentity:
+        return cls(
+            input_type=provider_id,
+            provider_id=provider_id,
+            provider_version=provider_version,
+            schema_version=SCHEMA_VERSION,
+            content_digest=content_digest,
+            digest_algorithm="sha256",
+            normalization_version=normalization_version,
+            repository_identity=repository_identity,
+            object_number=object_number,
+            base_sha=base_sha,
+            head_sha=head_sha,
         )
 
 
@@ -345,7 +386,7 @@ class CompletenessProof:
             raise ValueError("only complete input can form a completeness proof")
         if (
             not _SHA256.fullmatch(self.input_identity_digest)
-            or not _SHA256.fullmatch(self.fixed_version)
+            or not _GIT_SHA.fullmatch(self.fixed_version)
             or not _SHA256.fullmatch(self.change_set_digest)
         ):
             raise ValueError("completeness digests must be lowercase SHA-256")
@@ -454,7 +495,8 @@ class ChangeSet:
             proof.input_identity_digest != self.identity.identity_digest
             or proof.provider_id != self.identity.provider_id
             or proof.provider_version != self.identity.provider_version
-            or proof.fixed_version != self.identity.content_digest
+            or proof.fixed_version
+            != (self.identity.head_sha or self.identity.content_digest)
             or proof.normalization_version != self.normalization_version
             or self.normalization_version != self.identity.normalization_version
             or self.schema_version != self.identity.schema_version
@@ -499,7 +541,7 @@ class ChangeSet:
         if set(self.coverage.reviewable_file_ids) != expected_reviewable:
             raise ValueError("coverage does not match reviewable files")
         reference = self.sanitized_diff_ref
-        _validate_plain_diff_artifact(reference, self.identity, self.task_id)
+        _validate_input_artifact(reference, self.identity, self.task_id)
         if any(
             line.content_ref.artifact != reference
             for changed_file in self.files
@@ -549,8 +591,14 @@ class NormalizedInput:
             or self.binding.changeset_ref != expected_ref
         ):
             raise ValueError("input binding identity mismatch")
-        if self.binding.base_sha is not None or self.binding.head_sha is not None:
-            raise ValueError("plain diff binding cannot contain commit SHAs")
+        if self.change_set.identity.input_type == PLAIN_DIFF_PROVIDER_ID:
+            if self.binding.base_sha is not None or self.binding.head_sha is not None:
+                raise ValueError("plain diff binding cannot contain commit SHAs")
+        elif (
+            self.binding.base_sha != self.change_set.identity.base_sha
+            or self.binding.head_sha != self.change_set.identity.head_sha
+        ):
+            raise ValueError("remote binding commit SHA mismatch")
         if self.change_set.sanitized_diff_ref.task_id != self.binding.task_id:
             raise ValueError("input binding task mismatch")
 
@@ -786,22 +834,35 @@ def _artifact_ref_payload(reference: SanitizedArtifactRef) -> dict[str, object]:
     }
 
 
-def _validate_plain_diff_artifact(
+def _validate_input_artifact(
     reference: SanitizedArtifactRef,
     identity: InputIdentity,
     expected_task_id: str | None = None,
 ) -> None:
+    plain_diff = identity.input_type == PLAIN_DIFF_PROVIDER_ID
+    expected_artifact_id = (
+        f"plain-diff-{identity.identity_digest}"
+        if plain_diff
+        else f"{identity.input_type}-diff-{identity.identity_digest}"
+    )
     if (
         reference.task_id is None
         or (expected_task_id is not None and reference.task_id != expected_task_id)
-        or reference.source is not ArtifactSource.USER_CLI
+        or reference.source
+        is not (
+            ArtifactSource.USER_CLI if plain_diff else ArtifactSource.PLATFORM_RESPONSE
+        )
         or reference.kind is not ArtifactKind.DIFF
         or reference.purpose is not ArtifactPurpose.DOMAIN_INGRESS
         or reference.decision not in (SecurityDecision.SAFE, SecurityDecision.REDACTED)
-        or reference.artifact_id != f"plain-diff-{identity.identity_digest}"
-        or reference.provenance
+        or reference.artifact_id != expected_artifact_id
+        or (plain_diff and reference.provenance)
+        or (not plain_diff and len(reference.provenance) != 1)
     ):
         raise ValueError("plain diff security artifact identity mismatch")
+
+
+_validate_plain_diff_artifact = _validate_input_artifact
 
 
 def _validate_line_locations(hunk: Hunk) -> None:

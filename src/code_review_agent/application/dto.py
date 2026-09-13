@@ -14,6 +14,9 @@ class StartReviewCommand:
     output_path: Path
     subject: str = "Local diff review"
     source_url: str | None = None
+    provider: str = ""
+    model: str = ""
+    budget_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.task_id:

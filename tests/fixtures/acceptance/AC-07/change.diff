@@ -1,0 +1,9 @@
+diff --git a/service.go b/service.go
+index 1111111..2222222 100644
+--- a/service.go
++++ b/service.go
+@@ -1,3 +1,3 @@
+ func Health() string {
+-	return "ok"
++	return "ready"
+ }

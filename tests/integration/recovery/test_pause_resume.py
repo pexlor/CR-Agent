@@ -83,9 +83,7 @@ def test_resume_unknown_requires_explicit_confirmation() -> None:
     with pytest.raises(ValueError, match="unknown_retry_confirmation_required"):
         service.can_resume("task-recovery-unknown")
 
-    assert service.can_resume(
-        "task-recovery-unknown", confirm_unknown_retry=True
-    )
+    assert service.can_resume("task-recovery-unknown", confirm_unknown_retry=True)
 
 
 @pytest.mark.asyncio

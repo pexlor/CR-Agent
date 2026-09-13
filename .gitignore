@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 reports/
+state/*.sqlite3
 dist/
 build/
 *.egg-info/

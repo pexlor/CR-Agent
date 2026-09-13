@@ -1,5 +1,6 @@
 [output]
 reports_dir = "reports"
+state_database = "state/reviews.sqlite3"
 
 [budget]
 default_tokens = 50000
@@ -11,10 +12,10 @@ version = "1"
 model = "your-model"
 origin = "https://api.example.com"
 path = "/v1/chat/completions"
-api_key = "replace-with-your-token"
+api_key = "REPLACE_WITH_A_REAL_KEY"
 timeout_seconds = 60
 max_response_bytes = 1048576
-max_output_tokens = 1024
+max_output_tokens = 4096
 structured_output = "json_object"
 
 [rules]

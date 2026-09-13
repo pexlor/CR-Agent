@@ -138,6 +138,7 @@ class OpenAICompatibleProvider:
                 base_url=self._config.origin,
                 timeout=timeout,
                 follow_redirects=False,
+                trust_env=False,
             ) as client:
                 response = await client.post(
                     self._config.path,

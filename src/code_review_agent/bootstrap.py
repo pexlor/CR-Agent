@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol
 from uuid import uuid4
 
+from code_review_agent.adapters.credentials.keyring_store import KeyringCredentialStore
+from code_review_agent.adapters.input.github import GitHubInputProvider
+from code_review_agent.adapters.input.gitlab import GitLabInputProvider
 from code_review_agent.adapters.input.plain_diff import PlainDiffProvider
 from code_review_agent.adapters.model.openai_compatible import (
     OpenAICompatibleProvider,
 )
 from code_review_agent.adapters.output.markdown import MarkdownOutputAdapter
+from code_review_agent.adapters.registry import InputRegistry, ModelRegistry
 from code_review_agent.adapters.security.scanner import (
     FixedSecurityScanner,
     load_packaged_security_policy,
@@ -28,6 +32,7 @@ from code_review_agent.application.orchestration import (
     ReviewDependencies,
     ReviewOrchestrator,
 )
+from code_review_agent.application.persistence import ReviewStateStore
 from code_review_agent.application.task_service import LocalDiffReviewService
 from code_review_agent.config import CliConfig
 from code_review_agent.domain.budget.service import BudgetService
@@ -79,6 +84,22 @@ class CliRuntime(Protocol):
     def status(self, task_id: str) -> ReviewProgressView: ...
 
     def trace(self, trace_id: str) -> tuple[object, ...]: ...
+
+    def resume(
+        self, task_id: str, *, confirm_unknown_retry: bool = False
+    ) -> ReviewRunResult: ...
+
+    def terminate(
+        self, task_id: str, *, reason: str, expected_version: int
+    ) -> ReviewRunResult: ...
+
+    def cleanup(self, task_id: str, *, expected_version: int) -> None: ...
+
+    def retry_delivery(
+        self, task_id: str, *, expected_version: int
+    ) -> ReviewRunResult: ...
+
+    def providers(self) -> tuple[dict[str, str], ...]: ...
 
 
 class LocalModelProvider:
@@ -167,17 +188,27 @@ class _ConfiguredSteps:
     budget_account_id: str
     provider: Any
     tool_registry: ToolRegistry
+    input_registry: InputRegistry[Any]
     normalized: Any = None
     diff_text: str = ""
 
     def normalize(self, command: StartReviewCommand) -> Any:
-        if command.source_url is not None:
-            raise ValueError("url_provider_not_configured")
-        self.normalized = self.input_service.normalize_plain_diff(
-            task_id=self.task_id,
-            text=command.diff_text,
-            file_path=command.diff_file,
-        )
+        if command.source_url is None:
+            self.normalized = self.input_service.normalize_plain_diff(
+                task_id=self.task_id,
+                text=command.diff_text,
+                file_path=command.diff_file,
+            )
+        else:
+            provider_id = (
+                "github"
+                if command.source_url.startswith("https://github.com/")
+                else "gitlab"
+            )
+            provider = self.input_registry.resolve_exact(provider_id, "1")
+            self.normalized = InputService(
+                provider, self.security, clock=SystemClock()
+            ).normalize_remote(task_id=self.task_id, source_url=command.source_url)
         self.diff_text = self.security.resolve(
             self.normalized.change_set.sanitized_diff_ref,
             expected_purpose=ArtifactPurpose.DOMAIN_INGRESS,
@@ -187,7 +218,7 @@ class _ConfiguredSteps:
     def plan(self, normalized: Any) -> Any:
         task_spec = TaskSpec(
             spec_id="config-spec-1",
-            input_intent="plain_diff",
+            input_intent=normalized.change_set.identity.input_type,
             provider_id=self.config.provider_id,
             provider_version=self.config.provider_version,
             model_id=self.config.model_id,
@@ -198,28 +229,36 @@ class _ConfiguredSteps:
             security_policy_id=self.config.security_policy_id,
             security_policy_version=self.config.security_policy_version,
             config_digest=sha256_bytes(b"code-review-agent.toml"),
-            credential_alias="none",
+            credential_alias=(
+                "none"
+                if normalized.change_set.identity.input_type == "plain_diff"
+                else "shared"
+            ),
             budget_account_id=self.budget_account_id,
         )
         capabilities = self.provider.capabilities
-        return ReviewPlanner().plan(
-            PlanningRequest(
-                task_id=self.task_id,
-                task_spec=task_spec,
-                binding=normalized.binding,
-                change_set=normalized.change_set,
-                strategy=PlanningStrategy("file_first_v1", "1"),
-                model_capacity=ModelCapacitySummary(
-                    provider_id=capabilities.provider_id,
-                    provider_version=capabilities.provider_version,
-                    model_id=capabilities.model_id,
-                    context_token_limit=capabilities.context_token_limit,
-                    max_output_tokens=capabilities.max_output_tokens,
-                    token_counting_version="v1",
-                ),
-                tool_catalog=self.tool_registry.freeze(),
+        return (
+            ReviewPlanner()
+            .plan(
+                PlanningRequest(
+                    task_id=self.task_id,
+                    task_spec=task_spec,
+                    binding=normalized.binding,
+                    change_set=normalized.change_set,
+                    strategy=PlanningStrategy("file_first_v1", "1"),
+                    model_capacity=ModelCapacitySummary(
+                        provider_id=capabilities.provider_id,
+                        provider_version=capabilities.provider_version,
+                        model_id=capabilities.model_id,
+                        context_token_limit=capabilities.context_token_limit,
+                        max_output_tokens=capabilities.max_output_tokens,
+                        token_counting_version="v1",
+                    ),
+                    tool_catalog=self.tool_registry.freeze(),
+                )
             )
-        ).plan
+            .plan
+        )
 
     async def execute(self, unit: Any) -> WorkUnitExecutionResult:
         return await WorkUnitExecutor().execute(
@@ -242,16 +281,20 @@ class _ConfiguredSteps:
     def consolidate(
         self, normalized: Any, plan: Any, executions: tuple[Any, ...]
     ) -> Any:
-        return FindingProcessor().process(
-            FindingProcessingRequest(
-                request_id=f"consolidate-{self.task_id}",
-                task_id=self.task_id,
-                execution_fact_boundary_id=f"boundary-{self.task_id}",
-                change_set=normalized.change_set,
-                plan=plan,
-                executions=executions,
+        return (
+            FindingProcessor()
+            .process(
+                FindingProcessingRequest(
+                    request_id=f"consolidate-{self.task_id}",
+                    task_id=self.task_id,
+                    execution_fact_boundary_id=f"boundary-{self.task_id}",
+                    change_set=normalized.change_set,
+                    plan=plan,
+                    executions=executions,
+                )
             )
-        ).finding_set
+            .finding_set
+        )
 
     def snapshot(
         self,
@@ -261,13 +304,22 @@ class _ConfiguredSteps:
         executions: tuple[Any, ...],
         finding_set: Any,
     ) -> ResultSnapshot:
-        result_state = (
-            "no_changes"
-            if not normalized.change_set.files
-            else "complete_with_findings"
-            if finding_set.findings
-            else "complete_no_findings"
-        )
+        if not normalized.change_set.files:
+            result_state = "no_changes"
+        else:
+            coverage_states = {
+                getattr(entry.state, "value", entry.state)
+                for entry in finding_set.coverage.entries
+            }
+            result_state = (
+                "unknown"
+                if "unknown" in coverage_states
+                else "partial"
+                if coverage_states - {"reviewed"}
+                else "complete_with_findings"
+                if finding_set.findings
+                else "complete_no_findings"
+            )
         return ResultSnapshot(
             snapshot_id=f"snapshot-{self.task_id}",
             task_id=self.task_id,
@@ -296,7 +348,15 @@ class ConfiguredRuntime:
     def __init__(self, config: CliConfig) -> None:
         self.config = config
         self.orchestrator = ReviewOrchestrator()
-        self.tasks = LocalDiffReviewService(self.orchestrator)
+        self.store = ReviewStateStore(config.state_database)
+        self.tasks = LocalDiffReviewService(self.orchestrator, store=self.store)
+        self.model_registry: ModelRegistry[Any] = ModelRegistry()
+        self.model_registry.register(
+            config.provider_id,
+            config.provider_version,
+            self._create_model_provider(),
+        )
+        self.model_registry.freeze()
 
     def review(
         self,
@@ -309,27 +369,23 @@ class ConfiguredRuntime:
         del request_id
         if provider != self.config.provider_id or model != self.config.model_id:
             raise ValueError("provider_or_model_not_configured")
+        command = replace(
+            command,
+            provider=provider,
+            model=model,
+            budget_tokens=budget_tokens,
+        )
         policy = load_packaged_security_policy()
         security = SecurityService(FixedSecurityScanner(), policy=policy)
         budget = BudgetService()
         account = budget.create_account(
             command.task_id, budget_tokens, capability_ref="capability-1"
         )
-        if self.config.provider_id == "openai-compatible":
-            model_provider: Any = OpenAICompatibleProvider(self.config)
-        else:
-            model_provider = LocalModelProvider(self.config)
-        steps = _ConfiguredSteps(
-            config=self.config,
+        steps = self._build_steps(
             task_id=command.task_id,
             security=security,
-            input_service=InputService(
-                PlainDiffProvider(security), security, clock=SystemClock()
-            ),
             budget=budget,
-            budget_account_id=account.account_id,
-            provider=model_provider,
-            tool_registry=ToolRegistry.from_builtin(),
+            account_id=account.account_id,
         )
         return asyncio.run(self.tasks.start(command, ReviewDependencies(steps)))
 
@@ -343,7 +399,111 @@ class ConfiguredRuntime:
 
         return ReviewQueryService(self.orchestrator, self.tasks).get_trace(trace_id)
 
+    def resume(
+        self, task_id: str, *, confirm_unknown_retry: bool = False
+    ) -> ReviewRunResult:
+        command, provider, model, budget_tokens = self.store.command(task_id)
+        if provider != self.config.provider_id or model != self.config.model_id:
+            raise ValueError("provider_or_model_not_configured")
+        security = SecurityService(
+            FixedSecurityScanner(), policy=load_packaged_security_policy()
+        )
+        budget = BudgetService()
+        account = budget.create_account(
+            task_id, budget_tokens, capability_ref="capability-1"
+        )
+        steps = self._build_steps(
+            task_id=task_id,
+            security=security,
+            budget=budget,
+            account_id=account.account_id,
+        )
+        return asyncio.run(
+            self.tasks.resume(
+                task_id,
+                ReviewDependencies(steps),
+                confirm_unknown_retry=confirm_unknown_retry,
+            )
+        )
+
+    def _build_steps(
+        self,
+        *,
+        task_id: str,
+        security: SecurityService,
+        budget: BudgetService,
+        account_id: str,
+    ) -> _ConfiguredSteps:
+        model_provider = self.model_registry.resolve_exact(
+            self.config.provider_id, self.config.provider_version
+        )
+        return _ConfiguredSteps(
+            config=self.config,
+            task_id=task_id,
+            security=security,
+            input_service=InputService(
+                PlainDiffProvider(security), security, clock=SystemClock()
+            ),
+            budget=budget,
+            budget_account_id=account_id,
+            provider=model_provider,
+            tool_registry=ToolRegistry.from_builtin(),
+            input_registry=_build_input_registry(security),
+        )
+
+    def terminate(
+        self, task_id: str, *, reason: str, expected_version: int
+    ) -> ReviewRunResult:
+        self.tasks.get(task_id)
+        if expected_version != 1:
+            raise ValueError("version_conflict")
+        return self.tasks.terminate(task_id, reason=reason)
+
+    def cleanup(self, task_id: str, *, expected_version: int) -> None:
+        if expected_version != 1:
+            raise ValueError("version_conflict")
+        self.tasks.cleanup(task_id)
+
+    def retry_delivery(self, task_id: str, *, expected_version: int) -> ReviewRunResult:
+        result = self.tasks.get(task_id)
+        if expected_version != 1:
+            raise ValueError("version_conflict")
+        if result.report_path is None:
+            raise ValueError("report_not_found")
+        if not result.report_path.exists():
+            raise ValueError("report_not_found")
+        return result
+
+    def providers(self) -> tuple[dict[str, str], ...]:
+        return (
+            {"kind": "input", "provider_id": "plain_diff", "version": "1"},
+            {"kind": "input", "provider_id": "github", "version": "1"},
+            {"kind": "input", "provider_id": "gitlab", "version": "1"},
+            *(
+                {
+                    "kind": "model",
+                    "provider_id": provider_id,
+                    "version": version,
+                }
+                for provider_id, version in self.model_registry.list()
+            ),
+        )
+
+    def _create_model_provider(self) -> Any:
+        if self.config.provider_id == "openai-compatible":
+            return OpenAICompatibleProvider(self.config)
+        return LocalModelProvider(self.config)
+
 
 def build_runtime(config: CliConfig | None = None) -> CliRuntime:
     selected = config or CliConfig.from_file(Path("code-review-agent.toml"))
     return ConfiguredRuntime(selected)
+
+
+def _build_input_registry(security: SecurityService) -> InputRegistry[Any]:
+    credentials = KeyringCredentialStore()
+    registry: InputRegistry[Any] = InputRegistry()
+    registry.register("github", "1", GitHubInputProvider(security, credentials))
+    registry.register("gitlab", "1", GitLabInputProvider(security, credentials))
+    registry.freeze()
+    return registry

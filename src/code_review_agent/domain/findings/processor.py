@@ -107,9 +107,7 @@ class FindingProcessor:
         refs = [evidence.get(ref) for ref in candidate.evidence_refs]
         if any(item is None for item in refs):
             return FindingRejection(candidate.candidate_id, "evidence_not_found")
-        evidence_items: list[Any] = [
-            evidence[ref] for ref in candidate.evidence_refs
-        ]
+        evidence_items: list[Any] = [evidence[ref] for ref in candidate.evidence_refs]
         if not any(
             item.evidence_type in {"changed_code", "change_relation"}
             for item in evidence_items

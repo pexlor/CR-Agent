@@ -389,8 +389,14 @@ class WorkUnitExecutor:
     def _build_envelope(
         self, request: ExecutionRequest, tool_facts: tuple[str, ...]
     ) -> PromptEnvelope:
+        output_contract = (
+            "Return exactly one JSON object with one top-level field: "
+            '"findings". "findings" must always be an array; use an empty '
+            "array when there are no valid findings. Do not return summary, "
+            "markdown, prose, or any other top-level field."
+        )
         return PromptEnvelope(
-            system_rules=request.system_rules,
+            system_rules=f"{request.system_rules} {output_contract}",
             work_unit=request.work_unit.work_unit_id,
             diff=request.diff_text,
             controlled_context=(),
@@ -493,14 +499,24 @@ class WorkUnitExecutor:
             )
             if any(field_name not in raw for field_name in required):
                 return (), (), ResponseState.INVALID_OUTPUT
-            evidence = EvidenceReference(
+            model_evidence = EvidenceReference(
                 evidence_id=f"evidence-{request.execution_id}-{index}",
                 evidence_type="model_response",
                 source_ref=request.execution_id,
                 location=None,
                 content_digest=sha256_digest(dict(raw)),
             )
-            evidence_items.append(evidence)
+            changed_code_evidence = EvidenceReference(
+                evidence_id=f"changed-code-{request.execution_id}-{index}",
+                evidence_type="changed_code",
+                source_ref=request.work_unit.file_id,
+                location=CandidateLocation(
+                    kind=CandidateLocationKind.FILE,
+                    file_id=request.work_unit.file_id,
+                ),
+                content_digest=sha256_digest(request.diff_text),
+            )
+            evidence_items.extend((model_evidence, changed_code_evidence))
             candidates.append(
                 CandidateFinding(
                     candidate_id=f"candidate-{request.execution_id}-{index}",
@@ -515,7 +531,10 @@ class WorkUnitExecutor:
                         kind=CandidateLocationKind.FILE,
                         file_id=request.work_unit.file_id,
                     ),
-                    evidence_refs=(evidence.evidence_id,),
+                    evidence_refs=(
+                        model_evidence.evidence_id,
+                        changed_code_evidence.evidence_id,
+                    ),
                     impact=str(raw["impact"]),
                     suggestion=str(raw["suggestion"]),
                     change_causation=str(raw["change_causation"]),

@@ -1,16 +1,22 @@
 [output]
 reports_dir = "reports"
+state_database = "state/reviews.sqlite3"
 
 [budget]
-default_tokens = 50000
+default_tokens = 1000000
 max_tokens = 1000000
 
 [provider]
-id = "local"
+id = "openai-compatible"
 version = "1"
-model = "deterministic"
-origin = "https://local.invalid"
-max_output_tokens = 256
+model = "qianfan-code-latest"
+origin = "https://qianfan.baidubce.com"
+path = "/v2/tokenplan/personal/chat/completions"
+api_key = "REPLACE_WITH_A_REAL_KEY_IN_A_0600_LOCAL_CONFIG"
+timeout_seconds = 60
+max_response_bytes = 1048576
+max_output_tokens = 4096
+structured_output = "json_object"
 
 [rules]
 id = "default"

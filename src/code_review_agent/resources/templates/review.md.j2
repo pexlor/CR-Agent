@@ -40,7 +40,7 @@ Limitation: {{ limitation }}
 - Confidence basis: {{ finding.confidence_basis }}
 - Trace: `{{ finding.trace_id }}`
 {% else %}
-未发现有效问题。
+{% if completion.state == "complete_no_findings" %}未发现有效问题。{% else %}未形成完整审查结论，以上范围仍需补充审查。{% endif %}
 {% endfor %}
 
 ## Budget

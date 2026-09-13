@@ -31,9 +31,7 @@ class FakeRuntime:
         budget_tokens: int,
         request_id: str | None,
     ) -> ReviewRunResult:
-        self.review_calls.append(
-            (command, provider, model, budget_tokens, request_id)
-        )
+        self.review_calls.append((command, provider, model, budget_tokens, request_id))
         return self.result
 
     def status(self, task_id: str) -> ReviewProgressView:
@@ -47,6 +45,33 @@ class FakeRuntime:
 
     def trace(self, trace_id: str) -> tuple[object, ...]:
         return (SimpleNamespace(sequence=1, phase="completed", message=trace_id),)
+
+    def resume(
+        self, task_id: str, *, confirm_unknown_retry: bool = False
+    ) -> ReviewRunResult:
+        if task_id == "unknown" and not confirm_unknown_retry:
+            raise ValueError("unknown_retry_confirmation_required")
+        return self.result
+
+    def terminate(
+        self, task_id: str, *, reason: str, expected_version: int
+    ) -> ReviewRunResult:
+        assert task_id == "task-1"
+        assert reason
+        assert expected_version == 1
+        return self.result
+
+    def cleanup(self, task_id: str, *, expected_version: int) -> None:
+        assert task_id == "task-1"
+        assert expected_version == 1
+
+    def retry_delivery(self, task_id: str, *, expected_version: int) -> ReviewRunResult:
+        assert task_id == "task-1"
+        assert expected_version == 1
+        return self.result
+
+    def providers(self) -> tuple[dict[str, str], ...]:
+        return ({"kind": "input", "provider_id": "fake", "version": "1"},)
 
 
 def test_review_requires_exactly_one_input_source() -> None:
@@ -134,3 +159,75 @@ def test_status_and_trace_show_use_shared_output_contract() -> None:
     assert json.loads(status.stdout)["data"]["task_id"] == "task-1"
     assert trace.exit_code == 0
     assert json.loads(trace.stdout)["data"]["trace_id"] == "task-1"
+
+
+def test_control_commands_require_confirmation_and_forward_versions() -> None:
+    runtime = FakeRuntime()
+    runner = CliRunner()
+
+    missing_confirmation = runner.invoke(
+        create_app(lambda: runtime),
+        [
+            "terminate",
+            "task-1",
+            "--reason",
+            "operator request",
+            "--expected-version",
+            "1",
+        ],
+    )
+    terminated = runner.invoke(
+        create_app(lambda: runtime),
+        [
+            "terminate",
+            "task-1",
+            "--reason",
+            "operator request",
+            "--expected-version",
+            "1",
+            "--confirm",
+            "--request-id",
+            "req-1",
+        ],
+    )
+    cleaned = runner.invoke(
+        create_app(lambda: runtime),
+        ["cleanup", "task-1", "--expected-version", "1", "--confirm"],
+    )
+
+    assert missing_confirmation.exit_code == 2
+    assert terminated.exit_code == 0
+    assert json.loads(terminated.stdout)["request_id"] == "req-1"
+    assert cleaned.exit_code == 0
+
+
+def test_resume_unknown_requires_explicit_confirmation() -> None:
+    runtime = FakeRuntime()
+    runner = CliRunner()
+
+    blocked = runner.invoke(create_app(lambda: runtime), ["resume", "unknown"])
+    retried = runner.invoke(
+        create_app(lambda: runtime),
+        ["resume", "unknown", "--confirm-unknown-retry", "--json"],
+    )
+
+    assert blocked.exit_code == 3
+    assert "unknown_retry_confirmation_required" in blocked.stderr
+    assert retried.exit_code == 0
+
+
+def test_providers_and_report_retry_are_available() -> None:
+    runtime = FakeRuntime()
+    runner = CliRunner()
+
+    providers = runner.invoke(
+        create_app(lambda: runtime), ["providers", "--json", "--request-id", "req-2"]
+    )
+    retry = runner.invoke(
+        create_app(lambda: runtime),
+        ["report", "retry", "task-1", "--expected-version", "1"],
+    )
+
+    assert providers.exit_code == 0
+    assert json.loads(providers.stdout)["data"][0]["provider_id"] == "fake"
+    assert retry.exit_code == 0

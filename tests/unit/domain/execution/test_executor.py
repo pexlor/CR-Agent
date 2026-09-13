@@ -182,6 +182,21 @@ def _security_service() -> SecurityService:
     return SecurityService(_NoOpScanner(), policy=policy)
 
 
+def test_model_envelope_requires_array_only_review_output() -> None:
+    provider = FakeModelProvider(_model_capabilities(), results=())
+    budget_service, account_id = _budget()
+    request = _request(
+        provider=provider,
+        budget_service=budget_service,
+        account_id=account_id,
+    )
+
+    envelope = WorkUnitExecutor()._build_envelope(request, ())
+
+    assert '"findings" must always be an array' in envelope.system_rules
+    assert "Do not return summary" in envelope.system_rules
+
+
 class _NoToolCatalog:
     def freeze(self) -> ToolRegistrySnapshot:
         raise AssertionError("no tool catalog should be frozen in this test")
@@ -258,6 +273,49 @@ def test_successful_execution_produces_one_model_attempt_and_candidates() -> Non
     assert result.model_attempt is not None
     assert provider.send_calls == 1
     assert result.coverage_impact is CoverageImpact.FULLY_COVERED
+
+
+def test_successful_finding_retains_model_and_changed_code_evidence() -> None:
+    provider = FakeModelProvider(
+        _model_capabilities(),
+        results=(
+            ProviderSendResult(
+                provider_state=ProviderState.SUCCEEDED,
+                request_sent=True,
+                response_payload={
+                    "findings": [
+                        {
+                            "category": "correctness",
+                            "title": "Unchecked result",
+                            "problem": "The result is ignored.",
+                            "trigger_condition": "When the call fails.",
+                            "impact": "The operation can silently fail.",
+                            "suggestion": "Handle the returned error.",
+                            "change_causation": "The changed code drops the result.",
+                            "limitations": "",
+                        }
+                    ]
+                },
+                usage=ModelUsage(
+                    ModelUsageState.KNOWN, input_tokens=5, output_tokens=3
+                ),
+            ),
+        ),
+    )
+    budget_service, account_id = _budget()
+
+    result = asyncio.run(
+        WorkUnitExecutor().execute(
+            _request(
+                provider=provider, budget_service=budget_service, account_id=account_id
+            )
+        )
+    )
+
+    assert len(result.candidates) == 1
+    evidence_types = {item.evidence_type for item in result.evidence}
+    assert evidence_types == {"changed_code", "model_response"}
+    assert len(result.candidates[0].evidence_refs) == 2
 
 
 def test_at_most_one_model_call_per_execution() -> None:
@@ -701,8 +759,10 @@ def test_candidate_finding_only_references_its_own_execution_material() -> None:
     assert candidate.execution_id == result.execution_id
     assert candidate.work_unit_id == result.work_unit_id
     assert candidate.task_id == result.task_id
-    assert len(result.evidence) == 1
-    assert set(candidate.evidence_refs) == {result.evidence[0].evidence_id}
+    assert len(result.evidence) == 2
+    assert set(candidate.evidence_refs) == {
+        item.evidence_id for item in result.evidence
+    }
 
 
 def test_outbound_model_request_is_scanned_before_being_sent() -> None:

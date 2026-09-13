@@ -35,8 +35,7 @@ def _valid_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
         or not any(
-            parsed.netloc == host and marker in parsed.path
-            for host, marker in allowed
+            parsed.netloc == host and marker in parsed.path for host, marker in allowed
         )
     ):
         raise typer.BadParameter("URL must be an HTTPS GitHub PR or GitLab MR")
@@ -115,6 +114,161 @@ def build_commands(
             typer.echo(json_envelope("status", rid, result))
         else:
             typer.echo(human_result(result))
+
+    @app.command()
+    def resume(
+        task_id: str,
+        confirm_unknown_retry: bool = typer.Option(False, "--confirm-unknown-retry"),
+        json_output: bool = typer.Option(False, "--json"),
+        request_id: str | None = typer.Option(None, "--request-id"),
+    ) -> None:
+        rid = _request_id(request_id)
+        try:
+            result = runtime_factory().resume(
+                task_id, confirm_unknown_retry=confirm_unknown_retry
+            )
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(NOT_FOUND) from exc
+        typer.echo(
+            json_envelope("resume", rid, result)
+            if json_output
+            else human_result(result)
+        )
+
+    @app.command()
+    def terminate(
+        task_id: str,
+        reason: str = typer.Option(..., "--reason"),
+        expected_version: int = typer.Option(..., "--expected-version"),
+        confirm: bool = typer.Option(False, "--confirm"),
+        request_id: str | None = typer.Option(None, "--request-id"),
+    ) -> None:
+        if not confirm:
+            typer.echo("--confirm is required", err=True)
+            raise typer.Exit(USAGE_ERROR)
+        rid = _request_id(request_id)
+        try:
+            result = runtime_factory().terminate(
+                task_id, reason=reason, expected_version=expected_version
+            )
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(NOT_FOUND) from exc
+        typer.echo(json_envelope("terminate", rid, result))
+
+    @app.command()
+    def cleanup(
+        task_id: str,
+        expected_version: int = typer.Option(..., "--expected-version"),
+        confirm: bool = typer.Option(False, "--confirm"),
+    ) -> None:
+        if not confirm:
+            typer.echo("--confirm is required", err=True)
+            raise typer.Exit(USAGE_ERROR)
+        try:
+            runtime_factory().cleanup(task_id, expected_version=expected_version)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(NOT_FOUND) from exc
+        typer.echo(f"task_id={task_id} cleaned=true")
+
+    @app.command("providers")
+    def providers(
+        json_output: bool = typer.Option(False, "--json"),
+        request_id: str | None = typer.Option(None, "--request-id"),
+    ) -> None:
+        rid = _request_id(request_id)
+        data = runtime_factory().providers()
+        typer.echo(
+            json_envelope("providers", rid, data)
+            if json_output
+            else "\n".join(
+                f"{item['kind']} {item['provider_id']}@{item['version']}"
+                for item in data
+            )
+        )
+
+    delivery_app = typer.Typer(no_args_is_help=True, add_completion=False)
+    app.add_typer(delivery_app, name="report")
+
+    @delivery_app.command("retry")
+    def report_retry(
+        task_id: str,
+        expected_version: int = typer.Option(..., "--expected-version"),
+        request_id: str | None = typer.Option(None, "--request-id"),
+    ) -> None:
+        rid = _request_id(request_id)
+        try:
+            result = runtime_factory().retry_delivery(
+                task_id, expected_version=expected_version
+            )
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(NOT_FOUND) from exc
+        typer.echo(json_envelope("report retry", rid, result))
+
+    credentials_app = typer.Typer(no_args_is_help=True, add_completion=False)
+    app.add_typer(credentials_app, name="credentials")
+
+    @credentials_app.command("set")
+    def credentials_set(
+        provider_id: str,
+        secret: str = typer.Option(..., "--secret", hide_input=True),
+        alias: str = typer.Option("shared", "--alias"),
+    ) -> None:
+        from code_review_agent.adapters.credentials.keyring_store import (
+            KeyringCredentialStore,
+        )
+        from code_review_agent.application.credential_service import (
+            CredentialService,
+        )
+
+        CredentialService(KeyringCredentialStore()).set(
+            provider_id=provider_id, alias=alias, secret=secret
+        )
+        typer.echo(f"provider_id={provider_id} alias={alias} configured=true")
+
+    @credentials_app.command("clear")
+    def credentials_clear(
+        provider_id: str,
+        alias: str = typer.Option("shared", "--alias"),
+        confirm: bool = typer.Option(False, "--confirm"),
+    ) -> None:
+        if not confirm:
+            typer.echo("--confirm is required", err=True)
+            raise typer.Exit(USAGE_ERROR)
+        from code_review_agent.adapters.credentials.keyring_store import (
+            KeyringCredentialStore,
+        )
+        from code_review_agent.application.credential_service import (
+            CredentialService,
+        )
+
+        CredentialService(KeyringCredentialStore()).clear(
+            provider_id=provider_id, alias=alias
+        )
+        typer.echo(f"provider_id={provider_id} alias={alias} configured=false")
+
+    @credentials_app.command("status")
+    def credentials_status(
+        provider_id: str,
+        alias: str = typer.Option("shared", "--alias"),
+    ) -> None:
+        from code_review_agent.adapters.credentials.keyring_store import (
+            KeyringCredentialStore,
+        )
+        from code_review_agent.application.credential_service import (
+            CredentialService,
+        )
+
+        configured = CredentialService(KeyringCredentialStore()).exists(
+            provider_id=provider_id, alias=alias
+        )
+        typer.echo(
+            "provider_id="
+            f"{provider_id} alias={alias} configured={str(configured).lower()}"
+        )
 
     trace_app = typer.Typer(no_args_is_help=True, add_completion=False)
     app.add_typer(trace_app, name="trace")

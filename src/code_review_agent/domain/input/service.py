@@ -11,7 +11,6 @@ from code_review_agent.domain.common.digests import sha256_bytes, sha256_digest
 from code_review_agent.domain.common.errors import StableError
 from code_review_agent.domain.common.time import Clock
 from code_review_agent.domain.input.models import (
-    NORMALIZATION_VERSION,
     SCHEMA_VERSION,
     AcquiredPlainDiff,
     ArtifactSliceRef,
@@ -126,6 +125,33 @@ class InputService:
             raise RuntimeError("input normalization produced no result")
         return result
 
+    def normalize_remote(self, *, task_id: str, source_url: str) -> NormalizedInput:
+        acquire = getattr(self._provider, "acquire_url", None)
+        if acquire is None:
+            raise _error("url_provider_not_configured")
+        acquired = acquire(task_id=task_id, source_url=source_url)
+        sanitized: str | None = None
+        with suppress(RuntimeError, TypeError, ValueError):
+            sanitized = self._security.resolve(
+                acquired.artifact_ref,
+                expected_purpose=ArtifactPurpose.DOMAIN_INGRESS,
+            )
+        if sanitized is None:
+            raise _error("security_boundary_failed")
+        try:
+            return self._normalize_committed(
+                task_id=task_id, acquired=acquired, sanitized=sanitized
+            )
+        except _TooLarge as exc:
+            raise _error(
+                "input_too_large",
+                details={"metric": exc.metric, "limit": exc.limit},
+            ) from None
+        except _IncompleteDiff:
+            raise _error("input_incomplete") from None
+        except (_MalformedDiff, ValueError):
+            raise _error("input_malformed") from None
+
     def _normalize_committed(
         self,
         *,
@@ -162,7 +188,7 @@ class InputService:
             limits=self._limits,
             coverage=coverage,
             sanitized_diff_ref=acquired.artifact_ref,
-            normalization_version=NORMALIZATION_VERSION,
+            normalization_version=acquired.identity.normalization_version,
         )
         completeness = CompletenessProof(
             status=CompletenessStatus.COMPLETE,
@@ -170,7 +196,9 @@ class InputService:
             provider_id=acquired.identity.provider_id,
             provider_version=acquired.identity.provider_version,
             acquisition_attempts=1,
-            fixed_version=acquired.identity.content_digest,
+            fixed_version=(
+                acquired.identity.head_sha or acquired.identity.content_digest
+            ),
             byte_count=acquired.byte_count,
             file_count=len(files),
             changed_line_count=changed_line_count,
@@ -183,7 +211,7 @@ class InputService:
             version_drifted=False,
             binary_file_ids=unreviewable,
             change_set_digest=change_set_digest,
-            normalization_version=NORMALIZATION_VERSION,
+            normalization_version=acquired.identity.normalization_version,
         )
         change_set = ChangeSet(
             change_set_id=change_set_id,
@@ -198,7 +226,7 @@ class InputService:
             limits=self._limits,
             coverage=coverage,
             sanitized_diff_ref=acquired.artifact_ref,
-            normalization_version=NORMALIZATION_VERSION,
+            normalization_version=acquired.identity.normalization_version,
             change_set_digest=change_set_digest,
             created_at=self._clock.now(),
         )
@@ -213,10 +241,10 @@ class InputService:
                 }
             ),
             task_id=task_id,
-            input_type="plain_diff",
+            input_type=acquired.identity.input_type,
             object_identity=acquired.identity.identity_digest,
-            base_sha=None,
-            head_sha=None,
+            base_sha=acquired.identity.base_sha,
+            head_sha=acquired.identity.head_sha,
             content_digest=acquired.identity.content_digest,
             completeness_digest=completeness.proof_digest,
             changeset_ref=f"{change_set_id}:{change_set_digest}",

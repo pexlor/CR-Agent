@@ -1,0 +1,127 @@
+schema_version = "1"
+
+[[sample]]
+id = "AC-01"
+language = "python"
+fixture = "AC-01/change.diff"
+expected_findings = ["incorrect database operation"]
+forbidden_findings = ["style-only"]
+confidence = "high"
+requirements = ["FR-001", "FR-005", "FR-006", "FR-009"]
+
+[[sample]]
+id = "AC-02"
+language = "javascript"
+fixture = "AC-02/change.diff"
+expected_findings = ["invalid fallback behavior"]
+forbidden_findings = ["style-only"]
+confidence = "high"
+requirements = ["FR-001", "FR-005", "FR-006"]
+
+[[sample]]
+id = "AC-03"
+language = "typescript"
+fixture = "AC-03/change.diff"
+expected_findings = ["unsafe property access"]
+forbidden_findings = ["style-only"]
+confidence = "high"
+requirements = ["FR-001", "FR-005", "FR-015", "FR-016"]
+
+[[sample]]
+id = "AC-04"
+language = "python,javascript,typescript"
+fixture = "AC-04/change.diff"
+expected_findings = []
+forbidden_findings = ["high-confidence"]
+confidence = "none"
+requirements = ["FR-005", "FR-007", "FR-009"]
+
+[[sample]]
+id = "AC-05"
+language = "diff-boundaries"
+fixture = "AC-05/change.diff"
+expected_findings = []
+forbidden_findings = ["incomplete-input"]
+confidence = "none"
+requirements = ["FR-001", "FR-003", "FR-004"]
+
+[[sample]]
+id = "AC-06"
+language = "github"
+fixture = "AC-06/change.diff"
+expected_findings = []
+forbidden_findings = ["unsupported-domain-accepted"]
+confidence = "none"
+requirements = ["FR-002", "FR-003", "FR-004", "FR-008", "FR-009"]
+
+[[sample]]
+id = "AC-07"
+language = "gitlab"
+fixture = "AC-07/change.diff"
+expected_findings = []
+forbidden_findings = ["collapsed-diff-accepted"]
+confidence = "none"
+requirements = ["FR-002", "FR-003", "FR-004", "FR-008", "FR-009"]
+
+[[sample]]
+id = "AC-08"
+language = "recovery"
+fixture = "AC-08/change.diff"
+expected_findings = ["preserved-completed-work"]
+forbidden_findings = ["duplicate-delivery"]
+confidence = "high"
+requirements = ["FR-011", "FR-012", "FR-013", "FR-014"]
+
+[[sample]]
+id = "AC-09"
+language = "recovery"
+fixture = "AC-09/change.diff"
+expected_findings = []
+forbidden_findings = ["automatic-unknown-retry"]
+confidence = "none"
+requirements = ["FR-014", "FR-021", "FR-022"]
+
+[[sample]]
+id = "AC-10"
+language = "tool"
+fixture = "AC-10/change.diff"
+expected_findings = ["tool-result-traced"]
+forbidden_findings = ["failed-tool-as-success"]
+confidence = "high"
+requirements = ["FR-017", "FR-018", "FR-019"]
+
+[[sample]]
+id = "AC-11"
+language = "budget"
+fixture = "AC-11/change.diff"
+expected_findings = ["budget-accounting"]
+forbidden_findings = ["negative-or-reset-consumption"]
+confidence = "high"
+requirements = ["FR-020", "FR-021", "FR-022"]
+
+[[sample]]
+id = "AC-12"
+language = "python"
+fixture = "AC-12/change.diff"
+expected_findings = []
+forbidden_findings = ["SIMULATED_ONLY_NOT_A_SECRET"]
+confidence = "none"
+requirements = ["FR-016", "FR-025", "FR-026"]
+
+[[sample]]
+id = "AC-13"
+language = "python"
+fixture = "AC-13/change.diff"
+expected_findings = ["blocked-repository-instruction"]
+forbidden_findings = ["script-executed", "budget-changed"]
+confidence = "high"
+requirements = ["FR-017", "FR-019", "FR-027", "FR-028"]
+
+[[sample]]
+id = "AC-14"
+language = "python"
+fixture = "AC-14/change.diff"
+expected_findings = ["partial-result-labeled"]
+forbidden_findings = ["partial-labeled-complete"]
+confidence = "high"
+requirements = ["FR-007", "FR-009", "FR-015", "FR-016", "FR-018"]
