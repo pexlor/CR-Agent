@@ -76,11 +76,17 @@ class OpenAICompatibleProvider:
         envelope: PromptEnvelope,
         options: ModelRequestOptions,
     ) -> PreparedModelRequest:
+        output_schema = canonical_json(dict(envelope.output_schema))
+        system_rules = (
+            f"{envelope.system_rules}\n"
+            "Output JSON Schema (follow exactly):\n"
+            f"{output_schema}"
+        )
         body = canonical_json(
             {
                 "model": self._capabilities.model_id,
                 "messages": [
-                    {"role": "system", "content": envelope.system_rules},
+                    {"role": "system", "content": system_rules},
                     {
                         "role": "user",
                         "content": (

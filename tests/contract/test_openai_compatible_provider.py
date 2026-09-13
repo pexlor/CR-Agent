@@ -12,6 +12,7 @@ from code_review_agent.adapters.model.openai_compatible import (
     OpenAICompatibleProvider,
 )
 from code_review_agent.config import CliConfig
+from code_review_agent.domain.common.digests import canonical_json
 from code_review_agent.domain.execution.models import (
     ModelRequestOptions,
     PromptEnvelope,
@@ -69,6 +70,10 @@ def test_prepare_builds_fixed_request_without_exposing_token() -> None:
     assert body["stream"] is False
     assert body["temperature"] == 0
     assert body["response_format"] == {"type": "json_object"}
+    assert (
+        canonical_json(dict(_envelope().output_schema))
+        in body["messages"][0]["content"]
+    )
     assert "secret-token" not in repr(request)
     assert "secret-token" not in request.body.decode()
     assert provider.owns_prepared_request(request)

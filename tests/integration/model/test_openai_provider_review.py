@@ -109,3 +109,88 @@ def test_configured_runtime_does_not_report_provider_failure_as_no_findings(
     assert "审查部分完成" in report
     assert "provider_http_401" in report
     assert "未发现有效问题" not in report
+
+
+@respx.mock
+def test_configured_runtime_delivers_non_empty_model_finding(
+    tmp_path: Path,
+) -> None:
+    config = CliConfig(
+        provider_id="openai-compatible",
+        provider_version="1",
+        model_id="review-model",
+        provider_origin="https://api.example.com",
+        provider_path="/v1/chat/completions",
+        api_key="secret-token",
+        timeout_seconds=30,
+        max_response_bytes=1_048_576,
+        max_output_tokens=256,
+    )
+    route = respx.post("https://api.example.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "findings": [
+                                        {
+                                            "category": "correctness",
+                                            "title": "Wrong return shape",
+                                            "problem": "The loader returns a list.",
+                                            "trigger_condition": (
+                                                "When a caller requests one user."
+                                            ),
+                                            "impact": "Authentication can fail.",
+                                            "suggestion": "Return the matching user.",
+                                            "change_causation": (
+                                                "The changed line calls fetch_all."
+                                            ),
+                                            "limitations": "",
+                                        }
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 30},
+            },
+        )
+    )
+    command = StartReviewCommand(
+        task_id="task-http-finding",
+        diff_text=(
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-return db.fetch(user_id)\n"
+            "+return db.fetch_all(user_id)\n"
+        ),
+        diff_file=None,
+        output_path=tmp_path / "reports" / "finding.md",
+    )
+
+    result = ConfiguredRuntime(config).review(
+        command,
+        "openai-compatible",
+        "review-model",
+        50_000,
+        "request-http-finding",
+    )
+
+    assert route.called
+    request_body = json.loads(route.calls.last.request.content)
+    system_message = request_body["messages"][0]["content"]
+    assert "Output JSON Schema (follow exactly)" in system_message
+    assert '"trigger_condition"' in system_message
+    assert result.result_state == "complete_with_findings"
+    report = command.output_path.read_text(encoding="utf-8")
+    assert "Wrong return shape" in report
+    assert "The loader returns a list." in report
+    assert "Authentication can fail." in report
+    assert "Return the matching user." in report
+    assert "Trace:" in report

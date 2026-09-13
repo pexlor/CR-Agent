@@ -219,3 +219,16 @@ def test_coverage_projects_missing_execution_to_unreviewed():
     result = FindingProcessor().process(request)
 
     assert result.finding_set.coverage.entries[0].state.value == "unreviewed"
+
+
+def test_coverage_preserves_degraded_execution_error_code():
+    request = _request(_candidate())
+    execution = request.executions[0]
+    execution.coverage_impact = "degraded"
+    execution.error_code = "model_output_invalid"
+
+    result = FindingProcessor().process(request)
+
+    entry = result.finding_set.coverage.entries[0]
+    assert entry.state.value == "unreviewed"
+    assert entry.reason_code == "model_output_invalid"

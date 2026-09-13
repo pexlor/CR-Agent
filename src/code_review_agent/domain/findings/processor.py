@@ -276,7 +276,10 @@ class FindingProcessor:
                 ):
                     state, reason = CoverageState.REVIEWED, "execution_succeeded"
                 else:
-                    state, reason = CoverageState.UNREVIEWED, "coverage_degraded"
+                    state = CoverageState.UNREVIEWED
+                    reason = (
+                        getattr(execution, "error_code", None) or "coverage_degraded"
+                    )
             entries.append(CoverageEntry(scope.scope_id, state, reason))
         return CoverageSnapshot(
             task_id=request.task_id,
