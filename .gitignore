@@ -1,5 +1,6 @@
 .venv/
 .worktrees/
+code-review-agent.toml
 __pycache__/
 *.py[cod]
 .pytest_cache/

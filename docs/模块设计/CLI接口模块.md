@@ -32,11 +32,10 @@ maintenance backups list|delete BACKUP_ID
 ```text
 review (--diff-file PATH | --url URL | --stdin)
        --provider PROVIDER --model MODEL
-       [--budget-tokens N]
 resume TASK_ID [--add-budget-tokens N] [--confirm-unknown-retry]
 ```
 
-review 三种输入恰好一个；未指定且 stdin 非 TTY 时等价于 `--stdin`，TTY 不等待隐式输入。CLI 只构造来源 DTO；UTF-8、diff、规模、完整性和路径安全由输入用例处理。URL 语法层只接受 HTTPS GitHub.com PR/GitLab.com MR，拒绝 userinfo/query/fragment。预算默认 50000，语法范围 1..1000000。MVP 不接受自定义输出路径，报告位置始终由应用层按 task ID 派生为 `reports/<task_id>.md`，成功响应返回该规范化位置。
+review 三种输入恰好一个；未指定且 stdin 非 TTY 时等价于 `--stdin`，TTY 不等待隐式输入。CLI 只构造来源 DTO；UTF-8、diff、规模、完整性和路径安全由输入用例处理。URL 语法层只接受 HTTPS GitHub.com PR/GitLab.com MR，拒绝 userinfo/query/fragment。金额上限和模型每百万 token 单价只从本地配置读取，CLI 不接受预算参数；换算后的 token 授权范围为 1..1000000。MVP 不接受自定义输出路径，报告位置始终由应用层按 task ID 派生为 `reports/<task_id>.md`，成功响应返回该规范化位置。
 
 追加预算和 resume 是两个显式应用操作：先幂等追加，再恢复。两者使用父命令确定性派生的不同子 request ID 和各自请求指纹，并携带调用前取得的 `expected_task_version` 与类型化本机可信用户操作凭据；父命令步骤回执记录每步使用的任务版本与结果。版本冲突后重新读取状态，不复用旧版本盲重试。unknown 未确认时不调用外部系统；确认也不能绕过新预留。固定条件变化返回 `new_task_required`。severity 为内部字段，MVP CLI/Markdown 不展示标签。
 
