@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,8 @@ from code_review_agent.application.orchestration import (
 )
 from code_review_agent.application.persistence import ReviewStateStore
 from code_review_agent.application.task_service import LocalDiffReviewService
+from code_review_agent.bootstrap import ConfiguredRuntime
+from code_review_agent.config import CliConfig
 from code_review_agent.domain.budget.models import (
     BudgetAccountState,
     BudgetReservation,
@@ -28,6 +32,13 @@ from code_review_agent.domain.budget.models import (
     UsageState,
 )
 from code_review_agent.domain.budget.service import BudgetService
+from code_review_agent.domain.execution.execution_models import (
+    CoverageImpact,
+    ModelAttemptOutcomeKind,
+    ModelCallAttempt,
+    WorkUnitExecutionResult,
+    WorkUnitExecutionState,
+)
 from code_review_agent.domain.execution.models import (
     ModelCallState,
     ProviderState,
@@ -41,18 +52,52 @@ class _RecoveryUnit:
     execution_rank: int
 
 
-@dataclass(frozen=True)
-class _RecoveryExecution:
-    work_unit_id: str
-    comment: str
-    state: str = "succeeded"
-    execution_id: str = "execution"
-    attempt_number: int = 1
+def _recovery_execution(
+    work_unit_id: str,
+    *,
+    task_id: str,
+    state: WorkUnitExecutionState = WorkUnitExecutionState.SUCCEEDED,
+    execution_id: str = "execution",
+    attempt_number: int = 1,
+) -> WorkUnitExecutionResult:
+    unknown = state is WorkUnitExecutionState.UNKNOWN
+    model_attempt = (
+        ModelCallAttempt(
+            model_call_id=f"model-{execution_id}",
+            work_unit_id=work_unit_id,
+            execution_id=execution_id,
+            provider_id="provider",
+            model_id="model",
+            request_ref=None,
+            response_ref=None,
+            reservation_id=f"reservation-{execution_id}",
+        )
+        if unknown
+        else None
+    )
+    return WorkUnitExecutionResult(
+        execution_id=execution_id,
+        task_id=task_id,
+        work_unit_id=work_unit_id,
+        plan_id="plan-1",
+        attempt_number=attempt_number,
+        state=state,
+        coverage_impact=CoverageImpact.FULLY_COVERED,
+        tool_attempts=(),
+        model_attempt=model_attempt,
+        model_outcome_kind=(
+            ModelAttemptOutcomeKind.UNKNOWN
+            if unknown
+            else ModelAttemptOutcomeKind.NOT_ATTEMPTED
+        ),
+        candidates=(),
+    )
 
 
 class _InterruptingSteps:
     def __init__(self, *, fail_on: str | None = None) -> None:
         self.fail_on = fail_on
+        self.task_id = "task-units"
         self.calls: list[str] = []
         self.comments_seen: tuple[str, ...] = ()
 
@@ -70,16 +115,18 @@ class _InterruptingSteps:
             )
         )
 
-    async def execute(self, unit: _RecoveryUnit) -> _RecoveryExecution:
+    async def execute(self, unit: _RecoveryUnit) -> WorkUnitExecutionResult:
         self.calls.append(unit.work_unit_id)
         if unit.work_unit_id == self.fail_on:
             raise RuntimeError("injected interruption")
-        return _RecoveryExecution(unit.work_unit_id, f"comment for {unit.work_unit_id}")
+        return _recovery_execution(unit.work_unit_id, task_id=self.task_id)
 
     def consolidate(
         self, normalized: object, plan: object, executions: tuple[object, ...]
     ) -> object:
-        self.comments_seen = tuple(item.comment for item in executions)  # type: ignore[attr-defined]
+        self.comments_seen = tuple(
+            f"comment for {item.work_unit_id}" for item in executions  # type: ignore[attr-defined]
+        )
         return SimpleNamespace()
 
     def snapshot(
@@ -102,6 +149,7 @@ class _InterruptingSteps:
 class _UnknownThenSuccessfulSteps(_InterruptingSteps):
     def __init__(self) -> None:
         super().__init__()
+        self.task_id = "task-unknown"
         self.execution_ids: list[str] = []
         self.attempt_numbers: list[int] = []
 
@@ -111,10 +159,14 @@ class _UnknownThenSuccessfulSteps(_InterruptingSteps):
         execution_id = f"execution-{attempt}"
         self.execution_ids.append(execution_id)
         self.attempt_numbers.append(attempt)
-        return _RecoveryExecution(
-            work_unit_id=unit.work_unit_id,
-            comment=f"comment for {unit.work_unit_id}",
-            state="unknown" if attempt == 1 else "succeeded",
+        return _recovery_execution(
+            unit.work_unit_id,
+            task_id=self.task_id,
+            state=(
+                WorkUnitExecutionState.UNKNOWN
+                if attempt == 1
+                else WorkUnitExecutionState.SUCCEEDED
+            ),
             execution_id=execution_id,
             attempt_number=attempt,
         )
@@ -538,3 +590,51 @@ def test_checkpoint_round_trip_preserves_strenum_field_types(tmp_path: Path) -> 
     assert type(restored.response_state) is ResponseState
     assert restored.provider_state is ProviderState.SUCCEEDED
     assert restored.response_state is ResponseState.ACCEPTED
+
+
+def test_checkpoint_rejects_repository_type_before_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_imports: list[str] = []
+
+    def reject_import(module_name: str) -> object:
+        attempted_imports.append(module_name)
+        raise AssertionError("repository module import attempted")
+
+    monkeypatch.setattr(importlib, "import_module", reject_import)
+
+    with pytest.raises(ValueError, match="checkpoint_corrupt"):
+        ReviewStateStore._decode_checkpoint_value(
+            {
+                "__dataclass__": "test_repository_payload:Payload",
+                "fields": {},
+            }
+        )
+
+    assert attempted_imports == []
+
+
+def test_resume_rejects_changed_model_price_config(tmp_path: Path) -> None:
+    config = CliConfig(state_database=tmp_path / "state.sqlite3")
+    command = StartReviewCommand(
+        "task-price-change",
+        (
+            "diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        ),
+        None,
+        tmp_path / "report.md",
+    )
+    ConfiguredRuntime(config).review(
+        command, "local", "deterministic", "request-1"
+    )
+    changed_price = replace(
+        config, price_per_million_tokens_cny=Decimal("25.00")
+    )
+
+    with pytest.raises(ValueError, match="checkpoint_binding_mismatch"):
+        ConfiguredRuntime(changed_price).resume(command.task_id)

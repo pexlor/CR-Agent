@@ -73,7 +73,7 @@ def test_runtime_runs_declared_static_tool_and_traces_it(tmp_path: Path) -> None
     command = _command("task-tool-1", EVAL_DIFF, tmp_path)
 
     result = ConfiguredRuntime(config).review(
-        command, "openai-compatible", "review-model", 50_000, "request-tool-1"
+        command, "openai-compatible", "review-model", "request-tool-1"
     )
 
     assert result.result_state == "complete_no_findings"

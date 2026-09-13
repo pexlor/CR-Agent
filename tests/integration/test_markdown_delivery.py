@@ -74,6 +74,16 @@ def test_render_presents_location_budget_and_trace_as_stable_markdown():
             authorization_deficit=25,
             account_state="active",
             ledger_version=7,
+            currency="CNY",
+            configured_cost_limit="10.00",
+            price_per_million_tokens="20.00",
+            authorized_cost="0.020000000000",
+            known_cost="0.008000000000",
+            uncertain_cost="0.001000000000",
+            active_reservations_cost="0.002000000000",
+            remaining_cost="0.009000000000",
+            overage_cost="0.000000000000",
+            authorization_deficit_cost="0.000500000000",
         ),
         trace_summary=TraceReportView(
             task_id="task-1",
@@ -93,7 +103,7 @@ def test_render_presents_location_budget_and_trace_as_stable_markdown():
     )
     assert location_line == "- Location: `new_line file_abc123:42`"
     assert re.fullmatch(r"- Location: `[^`]+`", location_line)
-    assert "| Metric | Tokens / Value |" in rendered
+    assert "| Metric | Tokens / CNY / Value |" in rendered
     for metric, value in (
         ("Authorized", "1000 token"),
         ("Known consumption", "400 token"),
@@ -104,6 +114,18 @@ def test_render_presents_location_budget_and_trace_as_stable_markdown():
         ("Authorization deficit", "25 token"),
         ("Account state", "active"),
         ("Ledger version", "7"),
+    ):
+        assert f"| {metric} | {value} |" in rendered
+    for metric, value in (
+        ("Configured cost limit", "10.00 CNY"),
+        ("Price per million tokens", "20.00 CNY"),
+        ("Authorized cost", "0.020000000000 CNY"),
+        ("Known cost", "0.008000000000 CNY"),
+        ("Uncertain cost", "0.001000000000 CNY"),
+        ("Active reservations cost", "0.002000000000 CNY"),
+        ("Remaining cost", "0.009000000000 CNY"),
+        ("Overage cost", "0.000000000000 CNY"),
+        ("Authorization deficit cost", "0.000500000000 CNY"),
     ):
         assert f"| {metric} | {value} |" in rendered
     for metric, value in (

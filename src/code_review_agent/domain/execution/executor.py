@@ -464,7 +464,9 @@ class WorkUnitExecutor:
             "Return exactly one JSON object with one top-level field: "
             '"findings". "findings" must always be an array; use an empty '
             "array when there are no valid findings. Do not return summary, "
-            "markdown, prose, or any other top-level field."
+            "markdown, prose, or any other top-level field. Write all "
+            "human-readable finding content in Simplified Chinese, while "
+            "keeping JSON property names exactly as defined by the schema."
         )
         return PromptEnvelope(
             system_rules=f"{request.system_rules} {output_contract}",

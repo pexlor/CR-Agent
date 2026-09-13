@@ -197,6 +197,21 @@ def test_model_envelope_requires_array_only_review_output() -> None:
     assert "Do not return summary" in envelope.system_rules
 
 
+def test_model_envelope_requires_chinese_document_content() -> None:
+    provider = FakeModelProvider(_model_capabilities(), results=())
+    budget_service, account_id = _budget()
+    request = _request(
+        provider=provider,
+        budget_service=budget_service,
+        account_id=account_id,
+    )
+
+    envelope = WorkUnitExecutor()._build_envelope(request, ())
+
+    assert "Simplified Chinese" in envelope.system_rules
+    assert "JSON property names" in envelope.system_rules
+
+
 class _NoToolCatalog:
     def freeze(self) -> ToolRegistrySnapshot:
         raise AssertionError("no tool catalog should be frozen in this test")

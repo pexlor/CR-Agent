@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -14,6 +13,10 @@ from pathlib import Path
 from types import MappingProxyType
 
 from code_review_agent.adapters.sqlite.connection import connect_database
+from code_review_agent.application.checkpoint_types import (
+    require_trusted_checkpoint_type,
+    resolve_checkpoint_type,
+)
 from code_review_agent.application.dto import (
     PersistedTraceArtifactView,
     PersistedTraceEventView,
@@ -107,6 +110,15 @@ class ReviewStateStore:
                 CREATE TABLE IF NOT EXISTS review_trace_markers (
                     task_id TEXT PRIMARY KEY,
                     first_persisted_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_finding_traces (
+                    trace_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    finding_id TEXT NOT NULL,
+                    work_unit_ids_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    UNIQUE(task_id, finding_id)
                 );
                 CREATE TABLE IF NOT EXISTS review_budget_states (
                     task_id TEXT PRIMARY KEY,
@@ -645,9 +657,86 @@ class ReviewStateStore:
                 "ORDER BY sequence",
                 (task_id,),
             ).fetchall()
-            if not rows:
+            if rows:
+                return tuple(
+                    self._trace_event(connection, str(row[0])) for row in rows
+                )
+            link = connection.execute(
+                "SELECT task_id, finding_id, work_unit_ids_json "
+                "FROM review_finding_traces WHERE trace_id = ?",
+                (task_id,),
+            ).fetchone()
+            if link is None:
                 raise ValueError("trace_not_found")
-            return tuple(self._trace_event(connection, str(row[0])) for row in rows)
+            linked_task_id = str(link[0])
+            finding_id = str(link[1])
+            work_unit_ids = frozenset(json.loads(str(link[2])))
+            linked_rows = connection.execute(
+                "SELECT event_id FROM review_trace_events WHERE task_id = ? "
+                "ORDER BY sequence",
+                (linked_task_id,),
+            ).fetchall()
+            linked_events = tuple(
+                self._trace_event(connection, str(row[0])) for row in linked_rows
+            )
+        relevant_categories = {"input", "planning", "report"}
+        return tuple(
+            event
+            for event in linked_events
+            if event.category in relevant_categories
+            or event.summary.get("work_unit_id") in work_unit_ids
+            or (
+                event.event_type == "finding.validated"
+                and event.summary.get("finding_id") == finding_id
+            )
+        )
+
+    def link_finding_trace(
+        self,
+        *,
+        trace_id: str,
+        task_id: str,
+        finding_id: str,
+        work_unit_ids: tuple[str, ...],
+        expires_at: datetime | None = None,
+    ) -> None:
+        if not trace_id or not task_id or not finding_id or not work_unit_ids:
+            raise ValueError("finding_trace_fields_required")
+        normalized_units = tuple(sorted(set(work_unit_ids)))
+        created = datetime.now(UTC)
+        requested_expiry = expires_at or created + timedelta(days=7)
+        payload = json.dumps(normalized_units, separators=(",", ":"))
+        with self._connect() as connection:
+            event_expiry_row = connection.execute(
+                "SELECT MIN(expires_at) FROM review_trace_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if event_expiry_row is None or event_expiry_row[0] is None:
+                raise ValueError("finding_trace_events_required")
+            event_expiry = datetime.fromisoformat(str(event_expiry_row[0]))
+            expiry = min(requested_expiry.astimezone(UTC), event_expiry)
+            existing = connection.execute(
+                "SELECT task_id, finding_id, work_unit_ids_json "
+                "FROM review_finding_traces WHERE trace_id = ?",
+                (trace_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(map(str, existing)) != (task_id, finding_id, payload):
+                    raise ValueError("finding_trace_idempotency_conflict")
+                return
+            connection.execute(
+                "INSERT INTO review_finding_traces "
+                "(trace_id, task_id, finding_id, work_unit_ids_json, created_at, "
+                "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    trace_id,
+                    task_id,
+                    finding_id,
+                    payload,
+                    created.isoformat(),
+                    expiry.astimezone(UTC).isoformat(),
+                ),
+            )
 
     def cleanup_trace(self, task_id: str) -> None:
         with self._connect() as connection:
@@ -750,6 +839,9 @@ class ReviewStateStore:
     @staticmethod
     def _delete_task_trace(connection: sqlite3.Connection, task_id: str) -> None:
         connection.execute(
+            "DELETE FROM review_finding_traces WHERE task_id = ?", (task_id,)
+        )
+        connection.execute(
             "DELETE FROM review_trace_events WHERE task_id = ?", (task_id,)
         )
         connection.execute(
@@ -759,6 +851,9 @@ class ReviewStateStore:
     @staticmethod
     def _delete_expired_trace(connection: sqlite3.Connection, now: datetime) -> None:
         timestamp = now.isoformat()
+        connection.execute(
+            "DELETE FROM review_finding_traces WHERE expires_at <= ?", (timestamp,)
+        )
         connection.execute(
             "DELETE FROM review_trace_events WHERE expires_at <= ?", (timestamp,)
         )
@@ -787,7 +882,7 @@ class ReviewStateStore:
         # collapsing it to a plain string.
         if isinstance(value, Enum):
             return {
-                "__enum__": f"{type(value).__module__}:{type(value).__qualname__}",
+                "__enum__": require_trusted_checkpoint_type(type(value)),
                 "value": value.value,
             }
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -808,7 +903,7 @@ class ReviewStateStore:
                 if field.init and field.name not in {"raw", "content", "diff_text"}
             }
             return {
-                "__dataclass__": f"{type(value).__module__}:{type(value).__qualname__}",
+                "__dataclass__": require_trusted_checkpoint_type(type(value)),
                 "fields": safe_fields,
             }
         raise ValueError("checkpoint_value_not_serializable")
@@ -826,17 +921,9 @@ class ReviewStateStore:
             return tuple(cls._decode_checkpoint_value(item) for item in items)
         type_ref = value.get("__enum__") or value.get("__dataclass__")
         if type_ref is not None:
-            module_name, separator, qualname = str(type_ref).partition(":")
-            if not separator or (
-                not module_name.startswith(("code_review_agent.", "tests."))
-                and not module_name.startswith("test_")
-            ):
-                raise ValueError("checkpoint_corrupt")
-            target: object = importlib.import_module(module_name)
-            for part in qualname.split("."):
-                target = getattr(target, part)
+            target = resolve_checkpoint_type(str(type_ref))
             if "__enum__" in value:
-                return target(value["value"])  # type: ignore[operator]
+                return target(value["value"])
             raw_fields = value.get("fields")
             if not isinstance(raw_fields, dict):
                 raise ValueError("checkpoint_corrupt")
@@ -844,7 +931,7 @@ class ReviewStateStore:
                 str(key): cls._decode_checkpoint_value(item)
                 for key, item in raw_fields.items()
             }
-            return target(**decoded)  # type: ignore[operator]
+            return target(**decoded)
         return {
             str(key): cls._decode_checkpoint_value(item) for key, item in value.items()
         }

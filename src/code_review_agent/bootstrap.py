@@ -81,7 +81,6 @@ class CliRuntime(Protocol):
         command: StartReviewCommand,
         provider: str,
         model: str,
-        budget_tokens: int,
         request_id: str,
     ) -> ReviewRunResult: ...
 
@@ -390,7 +389,10 @@ class _ConfiguredSteps:
                 self._trace(
                     response_event,
                     "model",
-                    {"model_call_id": attempt.model_call_id},
+                    {
+                        "model_call_id": attempt.model_call_id,
+                        "work_unit_id": result.work_unit_id,
+                    },
                     f"{result.execution_id}-response",
                     self._artifact(
                         attempt.response_ref, ArtifactPurpose.TRACE_MODEL_RESPONSE
@@ -403,6 +405,7 @@ class _ConfiguredSteps:
                 {
                     "known_consumption": summary.known_consumption,
                     "uncertain_consumption": summary.uncertain_consumption,
+                    "work_unit_id": result.work_unit_id,
                 },
                 f"{result.execution_id}-budget",
             )
@@ -419,7 +422,13 @@ class _ConfiguredSteps:
             "ruleset_id": self.config.ruleset_id,
             "ruleset_version": self.config.ruleset_version,
             "config_digest": sha256_bytes(canonical_json({
-                "budget": command.budget_tokens,
+                    "budget": command.budget_tokens,
+                    "max_cost_per_review_cny": str(
+                        self.config.max_cost_per_review_cny
+                    ),
+                    "price_per_million_tokens_cny": str(
+                        self.config.price_per_million_tokens_cny
+                    ),
                 "provider": self.config.provider_id,
                 "model": self.config.model_id,
             }).encode()),
@@ -469,12 +478,38 @@ class _ConfiguredSteps:
             .finding_set
         )
         for finding in finding_set.findings:
+            source_candidate_ids = set(finding.source_candidate_ids)
+            work_unit_ids = tuple(
+                sorted(
+                    {
+                        execution.work_unit_id
+                        for execution in executions
+                        if any(
+                            candidate.candidate_id in source_candidate_ids
+                            for candidate in execution.candidates
+                        )
+                    }
+                )
+            )
             self._trace(
                 "finding.validated",
                 "finding",
-                {"finding_id": finding.finding_id, "trace_id": finding.trace_id},
+                {
+                    "finding_id": finding.finding_id,
+                    "trace_id": finding.trace_id,
+                    "work_unit_id": work_unit_ids[0],
+                },
                 f"finding-{finding.finding_id}",
             )
+            try:
+                self.trace_store.link_finding_trace(
+                    trace_id=finding.trace_id,
+                    task_id=self.task_id,
+                    finding_id=finding.finding_id,
+                    work_unit_ids=work_unit_ids,
+                )
+            except Exception:
+                self.trace_persistence_failed = True
         return finding_set
 
     def _trace_report(self) -> TraceReportView:
@@ -495,6 +530,7 @@ class _ConfiguredSteps:
 
     def _budget_report(self) -> BudgetReportView:
         summary = self.budget.get_summary(self.budget_account_id)
+        cost = self.config.cost_cny_for_tokens
         return BudgetReportView(
             task_id=self.task_id,
             authorized=summary.authorized,
@@ -506,6 +542,24 @@ class _ConfiguredSteps:
             authorization_deficit=summary.authorization_deficit,
             account_state=summary.account_state.value,
             ledger_version=summary.ledger_version,
+            currency="CNY",
+            configured_cost_limit=format(
+                self.config.max_cost_per_review_cny, "f"
+            ),
+            price_per_million_tokens=format(
+                self.config.price_per_million_tokens_cny, "f"
+            ),
+            authorized_cost=format(cost(summary.authorized), "f"),
+            known_cost=format(cost(summary.known_consumption), "f"),
+            uncertain_cost=format(cost(summary.uncertain_consumption), "f"),
+            active_reservations_cost=format(
+                cost(summary.active_reservations), "f"
+            ),
+            remaining_cost=format(cost(summary.remaining_budget), "f"),
+            overage_cost=format(cost(summary.overage), "f"),
+            authorization_deficit_cost=format(
+                cost(summary.authorization_deficit), "f"
+            ),
         )
 
     def snapshot(
@@ -599,7 +653,6 @@ class ConfiguredRuntime:
         command: StartReviewCommand,
         provider: str,
         model: str,
-        budget_tokens: int,
         request_id: str,
     ) -> ReviewRunResult:
         del request_id
@@ -609,12 +662,14 @@ class ConfiguredRuntime:
             command,
             provider=provider,
             model=model,
-            budget_tokens=budget_tokens,
+            budget_tokens=self.config.budget_tokens_per_review,
         )
         security = self._new_security_service()
         budget = self._new_budget_service()
         account = budget.create_account(
-            command.task_id, budget_tokens, capability_ref="capability-1"
+            command.task_id,
+            command.budget_tokens,
+            capability_ref="capability-1",
         )
         steps = self._build_steps(
             task_id=command.task_id,

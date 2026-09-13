@@ -56,9 +56,6 @@ def build_commands(
         url: str | None = typer.Option(None, "--url"),  # noqa: B008
         provider: str = typer.Option(..., "--provider"),  # noqa: B008
         model: str = typer.Option(..., "--model"),  # noqa: B008
-        budget_tokens: int = typer.Option(
-            cli_config.default_budget_tokens, "--budget-tokens"
-        ),  # noqa: B008
         json_output: bool = typer.Option(False, "--json"),  # noqa: B008
         no_color: bool = typer.Option(False, "--no-color"),  # noqa: B008
         verbose: bool = typer.Option(False, "--verbose"),  # noqa: B008
@@ -72,9 +69,6 @@ def build_commands(
         if source_count != 1:
             typer.echo("exactly one input source is required", err=True)
             raise typer.Exit(USAGE_ERROR)
-        if not 1 <= budget_tokens <= cli_config.max_budget_tokens:
-            typer.echo("budget-tokens must be between 1 and 1000000", err=True)
-            raise typer.Exit(USAGE_ERROR)
         source_url = _valid_url(url) if url is not None else None
         diff_text = sys.stdin.read() if stdin else None
         task_id = str(uuid4())
@@ -87,9 +81,7 @@ def build_commands(
         )
         rid = _request_id(request_id)
         try:
-            result = runtime_factory().review(
-                command, provider, model, budget_tokens, rid
-            )
+            result = runtime_factory().review(command, provider, model, rid)
         except Exception as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(INTERNAL_ERROR) from exc

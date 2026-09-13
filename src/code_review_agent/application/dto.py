@@ -87,6 +87,16 @@ class BudgetReportView:
     authorization_deficit: int
     account_state: str
     ledger_version: int
+    currency: str
+    configured_cost_limit: str
+    price_per_million_tokens: str
+    authorized_cost: str
+    known_cost: str
+    uncertain_cost: str
+    active_reservations_cost: str
+    remaining_cost: str
+    overage_cost: str
+    authorization_deficit_cost: str
 
 
 @dataclass(frozen=True, slots=True)

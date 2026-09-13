@@ -174,3 +174,80 @@ def test_initialization_removes_expired_detail_and_cleanup_removes_task_detail(
     restarted.cleanup_trace("live-task")
     with pytest.raises(ValueError, match="trace_not_found"):
         restarted.trace("live-task")
+
+
+def test_finding_trace_selects_only_its_work_unit_and_is_cleaned_up(
+    tmp_path: Path,
+) -> None:
+    store = ReviewStateStore(tmp_path / "state.sqlite3")
+    store.append_trace_event(
+        task_id="task-1",
+        event_id="input-1",
+        event_type="input.normalized",
+        category="input",
+        summary={"file_count": 2},
+        idempotency_key="input-1",
+    )
+    for unit_id in ("unit-1", "unit-2"):
+        store.append_trace_event(
+            task_id="task-1",
+            event_id=f"model-{unit_id}",
+            event_type="model.call_succeeded",
+            category="model",
+            summary={"model_call_id": f"call-{unit_id}", "work_unit_id": unit_id},
+            idempotency_key=f"model-{unit_id}",
+        )
+    store.append_trace_event(
+        task_id="task-1",
+        event_id="finding-1",
+        event_type="finding.validated",
+        category="finding",
+        summary={
+            "finding_id": "finding-1",
+            "trace_id": "comment-trace-1",
+            "work_unit_id": "unit-1",
+        },
+        idempotency_key="finding-1",
+    )
+    store.link_finding_trace(
+        trace_id="comment-trace-1",
+        task_id="task-1",
+        finding_id="finding-1",
+        work_unit_ids=("unit-1",),
+    )
+
+    selected = store.trace("comment-trace-1")
+
+    assert [event.event_id for event in selected] == [
+        "input-1",
+        "model-unit-1",
+        "finding-1",
+    ]
+    store.cleanup_trace("task-1")
+    with pytest.raises(ValueError, match="trace_not_found"):
+        store.trace("comment-trace-1")
+
+
+def test_finding_trace_expires_with_its_earliest_task_event(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = ReviewStateStore(database)
+    store.append_trace_event(
+        task_id="task-expiring",
+        event_id="expired-model",
+        event_type="model.call_succeeded",
+        category="model",
+        summary={"model_call_id": "call-1", "work_unit_id": "unit-1"},
+        idempotency_key="expired-model",
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    store.link_finding_trace(
+        trace_id="comment-expiring",
+        task_id="task-expiring",
+        finding_id="finding-1",
+        work_unit_ids=("unit-1",),
+    )
+
+    restarted = ReviewStateStore(database)
+
+    with pytest.raises(ValueError, match="trace_not_found"):
+        restarted.trace("comment-expiring")

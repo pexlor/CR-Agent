@@ -12,7 +12,7 @@ from code_review_agent.cli.app import create_app
 
 class FakeRuntime:
     def __init__(self) -> None:
-        self.review_calls: list[tuple[object, str, str, int, str | None]] = []
+        self.review_calls: list[tuple[object, str, str, str | None]] = []
         self.result = ReviewRunResult(
             task_id="task-1",
             session_id="session-1",
@@ -28,10 +28,9 @@ class FakeRuntime:
         command: object,
         provider: str,
         model: str,
-        budget_tokens: int,
         request_id: str | None,
     ) -> ReviewRunResult:
-        self.review_calls.append((command, provider, model, budget_tokens, request_id))
+        self.review_calls.append((command, provider, model, request_id))
         return self.result
 
     def status(self, task_id: str) -> ReviewProgressView:
@@ -95,7 +94,7 @@ def test_review_requires_exactly_one_input_source() -> None:
     assert runtime.review_calls == []
 
 
-def test_review_rejects_invalid_budget_without_calling_application() -> None:
+def test_review_rejects_removed_token_budget_option() -> None:
     runtime = FakeRuntime()
     result = CliRunner().invoke(
         create_app(lambda: runtime),
@@ -113,6 +112,7 @@ def test_review_rejects_invalid_budget_without_calling_application() -> None:
     )
 
     assert result.exit_code == 2
+    assert "No such option" in result.output
     assert runtime.review_calls == []
 
 
@@ -139,7 +139,7 @@ def test_review_json_uses_final_result_on_stdout(tmp_path: Path) -> None:
     assert payload["ok"] is True
     assert payload["data"]["task_id"] == "task-1"
     assert result.stderr == ""
-    assert runtime.review_calls[0][3] == 50_000
+    assert runtime.review_calls[0][3] == "request-1"
 
 
 def test_status_and_trace_show_use_shared_output_contract() -> None:

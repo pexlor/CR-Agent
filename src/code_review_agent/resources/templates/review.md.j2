@@ -45,7 +45,7 @@ Limitation: {{ limitation }}
 
 ## Budget
 
-| Metric | Tokens / Value |
+| Metric | Tokens / CNY / Value |
 | --- | --- |
 | Authorized | {{ budget.authorized | default(0) }} token |
 | Known consumption | {{ budget.known_consumption | default(0) }} token |
@@ -56,6 +56,15 @@ Limitation: {{ limitation }}
 | Authorization deficit | {{ budget.authorization_deficit | default(0) }} token |
 | Account state | {{ budget.account_state | default("unknown") }} |
 | Ledger version | {{ budget.ledger_version }} |
+| Configured cost limit | {{ budget.configured_cost_limit | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Price per million tokens | {{ budget.price_per_million_tokens | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Authorized cost | {{ budget.authorized_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Known cost | {{ budget.known_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Uncertain cost | {{ budget.uncertain_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Active reservations cost | {{ budget.active_reservations_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Remaining cost | {{ budget.remaining_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Overage cost | {{ budget.overage_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Authorization deficit cost | {{ budget.authorization_deficit_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
 
 ## Trace
 

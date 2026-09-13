@@ -6,9 +6,9 @@ diff、GitHub.com Pull Request 或 GitLab.com Merge Request，输出 Markdown
 
 ## 范围与非目标
 
-支持 Python 3.12、固定版本输入、token 预算、checkpoint、Trace、敏感信息扫描、
+支持 Python 3.12、固定版本输入、金额预算、checkpoint、Trace、敏感信息扫描、
 声明式只读工具和 Markdown 交付。首版不支持远程回评、GitHub Enterprise、
-自建 GitLab、多用户身份、金额预算、自动修复、自动合并，也不会执行被审查仓库的
+自建 GitLab、多用户身份、自动修复、自动合并，也不会执行被审查仓库的
 脚本、构建、测试、typecheck、插件或依赖。
 
 ## 安装
@@ -27,6 +27,9 @@ cp config.example.toml code-review-agent.toml
 chmod 600 code-review-agent.toml
 ```
 
+`code-review-agent.toml` is a local-only file and is ignored by Git. Never commit
+provider credentials; keep `config.example.toml` limited to placeholders.
+
 配置文件只用于本机可信用户。GitHub/GitLab 凭证应写入操作系统 keyring：
 
 ```bash
@@ -35,8 +38,10 @@ uv run code-review-agent credentials set gitlab --secret '<token>'
 uv run code-review-agent credentials status github
 ```
 
-模型 token 预算的单位是 token，单次任务最大为 1,000,000。预算不足、模型调用
-结果不明或安全扫描无法完成时，系统会停止或降级，不会伪装成完整成功。
+在 `[budget]` 中配置单次审查 CNY 上限和当前模型每百万 token 单价；系统向下取整
+换算成整数 token 授权，且不得超过 `max_tokens` 安全上限。价格变化后应创建新任务，
+不能把旧 checkpoint 按新价格继续使用。预算不足、模型调用结果不明或安全扫描无法
+完成时，系统会停止或降级，不会伪装成完整成功。
 
 ## 三种输入
 
