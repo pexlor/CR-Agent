@@ -15,15 +15,25 @@ from code_review_agent.domain.planning.models import (
     PlannedDisposition,
     PlanningStrategy,
     ReviewPlan,
+    ToolFailureImpact,
+    ToolSelection,
     WorkUnit,
     WorkUnitKind,
 )
 from code_review_agent.domain.task.models import InputBinding, TaskSpec
-from code_review_agent.ports.tools import ToolRegistrySnapshot
+from code_review_agent.ports.tools import (
+    ToolDeclaration,
+    ToolRegistrySnapshot,
+)
 
 CAPACITY_ESTIMATOR_VERSION = "conservative_byte_v1"
 _FIXED_OVERHEAD_TOKENS = 256
 _BYTES_PER_TOKEN = 4
+
+_FALLBACK_FAILURE_IMPACT: dict[str, ToolFailureImpact] = {
+    "partial_validation": ToolFailureImpact.EVIDENCE_DEGRADED,
+    "coverage_validation": ToolFailureImpact.COVERAGE_DEGRADED,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +47,7 @@ class PlanningRequest:
     strategy: PlanningStrategy
     model_capacity: ModelCapacitySummary
     tool_catalog: ToolRegistrySnapshot
+    tool_declarations: tuple[ToolDeclaration, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -82,11 +93,13 @@ class ReviewPlanner:
         work_units: list[WorkUnit] = []
         rank = 0
         for changed_file in _ordered_files(change_set.files):
+            tools = self._select_tools(request, changed_file)
             file_scopes, file_units, rank = self._plan_file(
                 plan_id=plan_id,
                 changed_file=changed_file,
                 strategy=request.strategy,
                 model_capacity=request.model_capacity,
+                tools=tools,
                 start_rank=rank,
             )
             scopes.extend(file_scopes)
@@ -114,6 +127,7 @@ class ReviewPlanner:
         changed_file: ChangedFile,
         strategy: PlanningStrategy,
         model_capacity: ModelCapacitySummary,
+        tools: tuple[ToolSelection, ...],
         start_rank: int,
     ) -> tuple[tuple[CoverageScope, ...], tuple[WorkUnit, ...], int]:
         rank = start_rank
@@ -136,6 +150,7 @@ class ReviewPlanner:
                 estimate=file_estimate,
                 strategy=strategy,
                 model_capacity=model_capacity,
+                tools=tools,
                 rank=rank,
             )
             return (
@@ -159,6 +174,7 @@ class ReviewPlanner:
                     estimate=_estimate_hunks(group),
                     strategy=strategy,
                     model_capacity=model_capacity,
+                    tools=tools,
                     rank=rank,
                 )
                 scopes.append(scope)
@@ -187,6 +203,7 @@ class ReviewPlanner:
                     estimate=estimate,
                     strategy=strategy,
                     model_capacity=model_capacity,
+                    tools=tools,
                     rank=rank,
                     line_subset=block,
                 )
@@ -207,6 +224,7 @@ class ReviewPlanner:
         estimate: tuple[int, int],
         strategy: PlanningStrategy,
         model_capacity: ModelCapacitySummary,
+        tools: tuple[ToolSelection, ...],
         rank: int,
         line_subset: tuple[Line, ...] | None = None,
     ) -> WorkUnit:
@@ -247,7 +265,7 @@ class ReviewPlanner:
             range=line_range,
             content_refs=content_refs,
             context_request=None,
-            tools=(),
+            tools=tools,
             capacity_estimate=CapacityEstimate(
                 estimator_version=CAPACITY_ESTIMATOR_VERSION,
                 estimated_input_tokens=input_tokens,
@@ -257,6 +275,53 @@ class ReviewPlanner:
             model_capacity=model_capacity,
             execution_rank=rank,
         )
+
+
+    def _select_tools(
+        self,
+        request: PlanningRequest,
+        changed_file: ChangedFile,
+    ) -> tuple[ToolSelection, ...]:
+        enabled = _parse_enabled_tools(request.task_spec.tools)
+        language = changed_file.language
+        selections: list[ToolSelection] = []
+        order = 0
+        for declaration in request.tool_declarations:
+            if (declaration.tool_id, declaration.version) not in enabled:
+                continue
+            if (
+                declaration.languages
+                and language not in declaration.languages
+                and "*" not in declaration.languages
+            ):
+                continue
+            selections.append(
+                ToolSelection(
+                    fixed_reference=declaration.fixed_reference(),
+                    applicable_rule_ids=tuple(
+                        rule.rule_id for rule in declaration.rules
+                    ),
+                    applicability_reason=f"language:{language}",
+                    planned_limits=declaration.limits,
+                    failure_impact=_FALLBACK_FAILURE_IMPACT.get(
+                        declaration.failure_impact, ToolFailureImpact.EVIDENCE_DEGRADED
+                    ),
+                    order=order,
+                )
+            )
+            order += 1
+        return tuple(selections)
+
+
+def _parse_enabled_tools(
+    tools: tuple[str, ...],
+) -> frozenset[tuple[str, str]]:
+    enabled: set[tuple[str, str]] = set()
+    for reference in tools:
+        tool_id, separator, version = reference.partition("@")
+        if separator and tool_id and version:
+            enabled.add((tool_id, version))
+    return frozenset(enabled)
 
 
 def _ordered_files(files: tuple[ChangedFile, ...]) -> tuple[ChangedFile, ...]:

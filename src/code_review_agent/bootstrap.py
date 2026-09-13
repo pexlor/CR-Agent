@@ -22,6 +22,7 @@ from code_review_agent.adapters.security.scanner import (
     load_packaged_security_policy,
 )
 from code_review_agent.adapters.tools.registry import ToolRegistry
+from code_review_agent.adapters.tools.runtime import RestrictedToolRuntime
 from code_review_agent.application.dto import (
     BudgetReportView,
     PersistedTraceArtifactView,
@@ -266,6 +267,9 @@ class _ConfiguredSteps:
         return self.normalized
 
     def plan(self, normalized: Any) -> Any:
+        tools = tuple(
+            f"{tool.tool_id}@{tool.version}" for tool in self.tool_registry.catalog()
+        )
         task_spec = TaskSpec(
             spec_id="config-spec-1",
             input_intent=normalized.change_set.identity.input_type,
@@ -275,7 +279,7 @@ class _ConfiguredSteps:
             provider_origin=self.config.provider_origin,
             ruleset_id=self.config.ruleset_id,
             ruleset_version=self.config.ruleset_version,
-            tools=(),
+            tools=tools,
             security_policy_id=self.config.security_policy_id,
             security_policy_version=self.config.security_policy_version,
             config_digest=sha256_bytes(b"code-review-agent.toml"),
@@ -305,6 +309,7 @@ class _ConfiguredSteps:
                         token_counting_version="v1",
                     ),
                     tool_catalog=self.tool_registry.freeze(),
+                    tool_declarations=tuple(self.tool_registry.catalog()),
                 )
             )
             .plan
@@ -330,11 +335,28 @@ class _ConfiguredSteps:
                 budget_account_id=self.budget_account_id,
                 security_service=self.security,
                 tool_catalog=self.tool_registry,
+                tool_runtime=RestrictedToolRuntime(self.tool_registry),
                 system_rules="Review only the supplied change.",
                 diff_text=self.diff_text,
                 model_call_guard=self.trace_store,
             )
         )
+        for tool_attempt in result.tool_attempts:
+            self._trace(
+                (
+                    "tool.succeeded"
+                    if tool_attempt.state.value == "succeeded"
+                    else "tool.failed"
+                ),
+                "tool",
+                {
+                    "tool_id": tool_attempt.tool_id,
+                    "tool_version": tool_attempt.tool_version,
+                    "work_unit_id": result.work_unit_id,
+                    "state": tool_attempt.state.value,
+                },
+                f"{result.execution_id}-tool-{tool_attempt.tool_attempt_id}",
+            )
         attempt = result.model_attempt
         if attempt is not None:
             terminal = f"model.call_{result.model_outcome_kind.value}"
