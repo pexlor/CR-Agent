@@ -118,17 +118,14 @@ def test_gitlab_provider_rejects_collapsed_diffs() -> None:
     respx.get(base + "/diffs?per_page=100").mock(
         return_value=httpx.Response(
             200,
-            json={
-                "overflow": False,
-                "diffs": [
-                    {
-                        "old_path": "app.py",
-                        "new_path": "app.py",
-                        "diff": "",
-                        "collapsed": True,
-                    }
-                ],
-            },
+            json=[
+                {
+                    "old_path": "app.py",
+                    "new_path": "app.py",
+                    "diff": "",
+                    "collapsed": True,
+                }
+            ],
         )
     )
 
@@ -137,3 +134,43 @@ def test_gitlab_provider_rejects_collapsed_diffs() -> None:
             task_id="task-1",
             source_url="https://gitlab.com/acme/app/merge_requests/8",
         )
+
+
+@respx.mock
+def test_gitlab_provider_parses_the_real_bare_array_diffs_response() -> None:
+    # GitLab.com's live /diffs endpoint returns a bare JSON array, not an
+    # object with a nested "diffs" list and "overflow" flag. This mirrors the
+    # exact shape observed from a real request against gitlab.com.
+    base = "https://gitlab.com/api/v4/projects/acme%2Fapp/merge_requests/9"
+    respx.get(base).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "state": "opened",
+                "diff_refs": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+            },
+        )
+    )
+    respx.get(base + "/diffs?per_page=100").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "old_path": "app.py",
+                    "new_path": "app.py",
+                    "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                    "collapsed": False,
+                    "too_large": False,
+                }
+            ],
+        )
+    )
+
+    acquired = GitLabInputProvider(security(), Credentials()).acquire_url(
+        task_id="task-1",
+        source_url="https://gitlab.com/acme/app/merge_requests/9",
+    )
+
+    assert acquired.identity.base_sha == "a" * 40
+    assert acquired.identity.head_sha == "b" * 40
+

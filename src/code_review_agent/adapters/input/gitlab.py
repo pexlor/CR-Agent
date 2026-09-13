@@ -52,8 +52,21 @@ class GitLabInputProvider(RemoteDiffProvider):
         while diff_url:
             page = self._request(diff_url, token=token)
             payload = page.json()
-            values = payload.get("diffs")
-            if not isinstance(values, list) or payload.get("overflow"):
+            # The real GitLab.com REST API returns a bare JSON array of diff
+            # entries from this endpoint. Some GitLab API responses elsewhere
+            # wrap paginated results in an object with a nested list plus an
+            # "overflow" flag; accept that shape too in case a self-hosted or
+            # future GitLab version wraps it, but the plain list is what the
+            # live API actually returns today.
+            if isinstance(payload, list):
+                values: object = payload
+                overflow = False
+            elif isinstance(payload, dict):
+                values = payload.get("diffs")
+                overflow = bool(payload.get("overflow"))
+            else:
+                raise _error("input_incomplete")
+            if not isinstance(values, list) or overflow:
                 raise _error("input_incomplete")
             files.extend(values)
             diff_url = parse_link_next(
@@ -88,5 +101,10 @@ def _gitlab_diff(files: list[dict[str, object]]) -> str:
             raise _error("input_incomplete")
         if item.get("collapsed") or item.get("too_large"):
             raise _error("input_incomplete")
-        chunks.append(f"diff --git a/{old} b/{new}\n--- a/{old}\n+++ b/{new}\n{diff}\n")
+        # GitLab's `diff` field already ends with its own trailing newline;
+        # appending another one here produces a spurious blank physical line
+        # that the unified-diff parser rejects as malformed.
+        chunks.append(
+            f"diff --git a/{old} b/{new}\n--- a/{old}\n+++ b/{new}\n{diff}"
+        )
     return "".join(chunks)
