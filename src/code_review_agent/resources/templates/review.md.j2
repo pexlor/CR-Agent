@@ -30,7 +30,7 @@ Limitation: {{ limitation }}
 ### {{ finding.title }}
 
 - ID: `{{ finding.finding_id }}`
-- Location: `{{ finding.location.kind.value }} `{{ finding.location.file_id }}`{% if finding.location.line %}:{{ finding.location.line }}{% endif %}
+- Location: `{{ finding.location.kind.value }} {{ finding.location.file_id }}{% if finding.location.line %}:{{ finding.location.line }}{% endif %}`
 - Severity: `{{ finding.severity }}`
 - Confidence: `{{ finding.confidence.value }}`
 - Problem: {{ finding.problem }}
@@ -45,8 +45,26 @@ Limitation: {{ limitation }}
 
 ## Budget
 
-{{ budget }}
+| Metric | Tokens / Value |
+| --- | --- |
+| Authorized | {{ budget.authorized | default(0) }} token |
+| Known consumption | {{ budget.known_consumption | default(0) }} token |
+| Uncertain consumption | {{ budget.uncertain_consumption | default(0) }} token |
+| Active reservations | {{ budget.active_reservations | default(0) }} token |
+| Remaining | {{ budget.remaining_budget | default(0) }} token |
+| Overage | {{ budget.overage | default(0) }} token |
+| Authorization deficit | {{ budget.authorization_deficit | default(0) }} token |
+| Account state | {{ budget.account_state | default("unknown") }} |
+| Ledger version | {{ budget.ledger_version }} |
 
 ## Trace
 
-{{ trace }}
+| Metric | Count |
+| --- | --- |
+| Event count | {{ trace.event_count | default(0) }} |
+| Model calls | {{ trace.model_call_count | default(0) }} |
+| Accepted | {{ trace.accepted_count | default(0) }} |
+| Rejected | {{ trace.rejected_count | default(0) }} |
+| Errors | {{ trace.error_count | default(0) }} |
+
+Full trace: `uv run code-review-agent trace show {{ task_id }}`

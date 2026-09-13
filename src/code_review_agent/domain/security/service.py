@@ -249,3 +249,7 @@ class SecurityService:
             categories.add(category)
         chunks.append(content[cursor:])
         return "".join(chunks), categories
+
+    @property
+    def policy(self) -> SecurityPolicy:
+        return self._policy

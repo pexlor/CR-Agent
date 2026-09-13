@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+type TraceSummaryScalar = str | int | float | bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +37,56 @@ class TraceEventView:
     sequence: int
     phase: str
     message: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedTraceArtifactView:
+    artifact_id: str
+    purpose: str
+    content: str
+    content_digest: str
+    security_decision: str
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedTraceEventView:
+    event_id: str
+    task_id: str
+    sequence: int
+    event_type: str
+    category: str
+    summary: Mapping[str, TraceSummaryScalar]
+    idempotency_key: str
+    created_at: str
+    expires_at: str
+    artifact: PersistedTraceArtifactView | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraceReportView:
+    task_id: str
+    event_count: int
+    model_call_count: int
+    accepted_count: int
+    rejected_count: int
+    error_count: int
+    query_command: str
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetReportView:
+    task_id: str
+    authorized: int
+    known_consumption: int
+    uncertain_consumption: int
+    active_reservations: int
+    remaining_budget: int
+    overage: int
+    authorization_deficit: int
+    account_state: str
+    ledger_version: int
 
 
 @dataclass(frozen=True, slots=True)

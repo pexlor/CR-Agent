@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from code_review_agent.application.dto import (
+    PersistedTraceEventView,
     ReviewRunResult,
     StartReviewCommand,
     TraceEventView,
@@ -17,6 +19,7 @@ from code_review_agent.application.orchestration import (
     ReviewOrchestrator,
     SessionPhase,
 )
+from code_review_agent.application.persistence import ReviewStateStore
 from code_review_agent.application.query_service import ReviewQueryService
 from code_review_agent.application.task_service import LocalDiffReviewService
 
@@ -162,3 +165,77 @@ async def test_task_service_persists_result_for_read_only_queries(
 
     assert view.task_id == result.task_id
     assert view.trace == result.trace
+
+
+def test_query_service_prefers_persisted_trace_and_falls_back_to_stage_trace(
+    tmp_path: Path,
+) -> None:
+    store = ReviewStateStore(tmp_path / "state.sqlite3")
+    legacy = ReviewRunResult(
+        task_id="task-1",
+        session_id="session-1",
+        phase="completed",
+        result_state="complete_no_findings",
+        delivery_state="succeeded",
+        report_path=None,
+        report_digest=None,
+        trace=(TraceEventView(1, "completed", "done"),),
+    )
+    store.save(legacy)
+    service = LocalDiffReviewService(ReviewOrchestrator(), store=store)
+    queries = ReviewQueryService(ReviewOrchestrator(), service)
+    assert queries.get_trace("task-1") == legacy.trace
+
+    detailed = store.append_trace_event(
+        task_id="task-1",
+        event_id="event-1",
+        event_type="report.delivered",
+        category="report",
+        summary={"delivered": True},
+        idempotency_key="report-delivered",
+    )
+    result = queries.get_trace("task-1")
+    assert result == (detailed,)
+    assert isinstance(result[0], PersistedTraceEventView)
+
+
+@pytest.mark.parametrize("remove_mode", ["cleanup", "expiry"])
+def test_query_service_does_not_fallback_after_detailed_trace_removal(
+    tmp_path: Path, remove_mode: str
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = ReviewStateStore(database)
+    legacy = ReviewRunResult(
+        task_id="task-1",
+        session_id="session-1",
+        phase="completed",
+        result_state="complete_no_findings",
+        delivery_state="succeeded",
+        report_path=None,
+        report_digest=None,
+        trace=(TraceEventView(1, "completed", "legacy fallback"),),
+    )
+    store.save(legacy)
+    store.append_trace_event(
+        task_id="task-1",
+        event_id="event-1",
+        event_type="report.delivered",
+        category="report",
+        summary={"delivered": True},
+        idempotency_key="report-delivered",
+        expires_at=(
+            datetime.now(UTC) - timedelta(seconds=1)
+            if remove_mode == "expiry"
+            else None
+        ),
+    )
+    if remove_mode == "cleanup":
+        store.cleanup_trace("task-1")
+    else:
+        store = ReviewStateStore(database)
+    queries = ReviewQueryService(
+        ReviewOrchestrator(), LocalDiffReviewService(ReviewOrchestrator(), store=store)
+    )
+
+    with pytest.raises(ValueError, match="trace_not_found"):
+        queries.get_trace("task-1")

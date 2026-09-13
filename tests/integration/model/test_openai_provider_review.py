@@ -16,6 +16,7 @@ def test_configured_runtime_completes_review_with_openai_provider(
     tmp_path: Path,
 ) -> None:
     config = CliConfig(
+        state_database=tmp_path / "state-http-1.sqlite3",
         provider_id="openai-compatible",
         provider_version="1",
         model_id="review-model",
@@ -68,6 +69,7 @@ def test_configured_runtime_does_not_report_provider_failure_as_no_findings(
     tmp_path: Path,
 ) -> None:
     config = CliConfig(
+        state_database=tmp_path / "state-http-401.sqlite3",
         provider_id="openai-compatible",
         provider_version="1",
         model_id="review-model",
@@ -116,6 +118,7 @@ def test_configured_runtime_delivers_non_empty_model_finding(
     tmp_path: Path,
 ) -> None:
     config = CliConfig(
+        state_database=tmp_path / "state-http-finding.sqlite3",
         provider_id="openai-compatible",
         provider_version="1",
         model_id="review-model",

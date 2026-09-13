@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, cast
+
+from code_review_agent.application.dto import (
+    PersistedTraceEventView,
+    TraceEventView,
+)
 
 
 def _json_value(value: Any) -> Any:
@@ -13,11 +19,12 @@ def _json_value(value: Any) -> Any:
         return str(value)
     if is_dataclass(value):
         return {
-            key: _json_value(item) for key, item in asdict(cast(Any, value)).items()
+            field.name: _json_value(getattr(value, field.name))
+            for field in fields(cast(Any, value))
         }
     if isinstance(value, tuple):
         return [_json_value(item) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
     if hasattr(value, "__dict__"):
         return {str(key): _json_value(item) for key, item in vars(value).items()}
@@ -54,5 +61,27 @@ def human_result(data: Any) -> str:
     return str(data)
 
 
-def human_trace(trace_id: str, events: tuple[Any, ...]) -> str:
-    return "\n".join(f"{trace_id} [{event.phase}] {event.message}" for event in events)
+def human_trace(
+    trace_id: str, events: tuple[object, ...]
+) -> str:
+    lines: list[str] = []
+    for event in events:
+        if isinstance(event, PersistedTraceEventView):
+            summary = json.dumps(
+                dict(event.summary), sort_keys=True, separators=(",", ":")
+            )
+            artifact = ""
+            if event.artifact is not None:
+                artifact = (
+                    f" artifact={event.artifact.artifact_id}:"
+                    f"{event.artifact.purpose}:{event.artifact.security_decision}"
+                )
+            lines.append(
+                f"{trace_id} [{event.category}] {event.event_type} "
+                f"summary={summary}{artifact}"
+            )
+        elif isinstance(event, TraceEventView):
+            lines.append(f"{trace_id} [{event.phase}] {event.message}")
+        else:
+            raise TypeError("trace_event_invalid")
+    return "\n".join(lines)

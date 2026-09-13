@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -24,9 +23,12 @@ from code_review_agent.adapters.security.scanner import (
 )
 from code_review_agent.adapters.tools.registry import ToolRegistry
 from code_review_agent.application.dto import (
+    BudgetReportView,
+    PersistedTraceArtifactView,
     ReviewProgressView,
     ReviewRunResult,
     StartReviewCommand,
+    TraceReportView,
 )
 from code_review_agent.application.orchestration import (
     ReviewDependencies,
@@ -35,6 +37,7 @@ from code_review_agent.application.orchestration import (
 from code_review_agent.application.persistence import ReviewStateStore
 from code_review_agent.application.task_service import LocalDiffReviewService
 from code_review_agent.config import CliConfig
+from code_review_agent.domain.budget.models import UsageState as BudgetUsageState
 from code_review_agent.domain.budget.service import BudgetService
 from code_review_agent.domain.common.digests import canonical_json, sha256_bytes
 from code_review_agent.domain.common.time import SystemClock
@@ -189,8 +192,49 @@ class _ConfiguredSteps:
     provider: Any
     tool_registry: ToolRegistry
     input_registry: InputRegistry[Any]
+    trace_store: ReviewStateStore
     normalized: Any = None
     diff_text: str = ""
+    trace_persistence_failed: bool = False
+
+    def _trace(
+        self,
+        event_type: str,
+        category: str,
+        summary: dict[str, object],
+        idempotency_key: str,
+        artifact: PersistedTraceArtifactView | None = None,
+    ) -> None:
+        try:
+            self.trace_store.append_trace_event(
+                task_id=self.task_id,
+                event_id=f"{self.task_id}:{idempotency_key}",
+                event_type=event_type,
+                category=category,
+                summary=summary,
+                idempotency_key=idempotency_key,
+                artifact=artifact,
+            )
+        except Exception:
+            self.trace_persistence_failed = True
+
+    def _artifact(
+        self, reference: Any, purpose: ArtifactPurpose
+    ) -> PersistedTraceArtifactView | None:
+        if reference is None:
+            return None
+        try:
+            content = self.security.resolve(reference, expected_purpose=purpose)
+        except Exception:
+            self.trace_persistence_failed = True
+            return None
+        return PersistedTraceArtifactView(
+            artifact_id=reference.artifact_id,
+            purpose=reference.purpose.value,
+            content=content,
+            content_digest=reference.sanitized_digest,
+            security_decision=reference.decision.value,
+        )
 
     def normalize(self, command: StartReviewCommand) -> Any:
         if command.source_url is None:
@@ -212,6 +256,12 @@ class _ConfiguredSteps:
         self.diff_text = self.security.resolve(
             self.normalized.change_set.sanitized_diff_ref,
             expected_purpose=ArtifactPurpose.DOMAIN_INGRESS,
+        )
+        self._trace(
+            "input.normalized",
+            "input",
+            {"file_count": len(self.normalized.change_set.files)},
+            "input-normalized",
         )
         return self.normalized
 
@@ -237,7 +287,7 @@ class _ConfiguredSteps:
             budget_account_id=self.budget_account_id,
         )
         capabilities = self.provider.capabilities
-        return (
+        plan = (
             ReviewPlanner()
             .plan(
                 PlanningRequest(
@@ -259,9 +309,16 @@ class _ConfiguredSteps:
             )
             .plan
         )
+        self._trace(
+            "planning.plan_created",
+            "planning",
+            {"plan_id": plan.plan_id, "work_unit_count": len(plan.work_units)},
+            "plan-created",
+        )
+        return plan
 
     async def execute(self, unit: Any) -> WorkUnitExecutionResult:
-        return await WorkUnitExecutor().execute(
+        result = await WorkUnitExecutor().execute(
             ExecutionRequest(
                 task_id=self.task_id,
                 work_unit=unit,
@@ -275,13 +332,107 @@ class _ConfiguredSteps:
                 tool_catalog=self.tool_registry,
                 system_rules="Review only the supplied change.",
                 diff_text=self.diff_text,
+                model_call_guard=self.trace_store,
             )
+        )
+        attempt = result.model_attempt
+        if attempt is not None:
+            terminal = f"model.call_{result.model_outcome_kind.value}"
+            self._trace(
+                terminal,
+                "model",
+                {
+                    "model_call_id": attempt.model_call_id,
+                    "work_unit_id": result.work_unit_id,
+                },
+                f"{result.execution_id}-model-terminal",
+                self._artifact(
+                    attempt.request_ref, ArtifactPurpose.TRACE_MODEL_REQUEST
+                ),
+            )
+            provider_succeeded = (
+                attempt.outcome is not None
+                and
+                attempt.outcome.state.provider_state is ProviderState.SUCCEEDED
+            )
+            accepted = provider_succeeded and result.error_code not in {
+                "model_output_invalid",
+                "security_boundary_failed",
+            } and attempt.response_ref is not None
+            if provider_succeeded:
+                response_event = (
+                    "model.response_accepted"
+                    if accepted
+                    else "model.response_rejected"
+                )
+                self._trace(
+                    response_event,
+                    "model",
+                    {"model_call_id": attempt.model_call_id},
+                    f"{result.execution_id}-response",
+                    self._artifact(
+                        attempt.response_ref, ArtifactPurpose.TRACE_MODEL_RESPONSE
+                    ),
+                )
+            summary = self.budget.get_summary(self.budget_account_id)
+            self._trace(
+                "budget.usage_settled",
+                "budget",
+                {
+                    "known_consumption": summary.known_consumption,
+                    "uncertain_consumption": summary.uncertain_consumption,
+                },
+                f"{result.execution_id}-budget",
+            )
+        return result
+
+    def checkpoint_binding_digest(self, command: StartReviewCommand) -> str:
+        capabilities = self.provider.capabilities
+        tool_snapshot = self.tool_registry.freeze()
+        task_spec = {
+            "provider_id": self.config.provider_id,
+            "provider_version": self.config.provider_version,
+            "model_id": self.config.model_id,
+            "provider_origin": self.config.provider_origin,
+            "ruleset_id": self.config.ruleset_id,
+            "ruleset_version": self.config.ruleset_version,
+            "config_digest": sha256_bytes(canonical_json({
+                "budget": command.budget_tokens,
+                "provider": self.config.provider_id,
+                "model": self.config.model_id,
+            }).encode()),
+        }
+        return sha256_bytes(
+            canonical_json(
+                {
+                    "task_spec": task_spec,
+                    "provider": {
+                        "version": capabilities.provider_version,
+                        "origin": capabilities.origin,
+                    },
+                    "max_output_tokens": self.config.max_output_tokens,
+                    "structured_strategy": self.config.structured_output,
+                    "tools": [
+                        {
+                            "id": item.tool_id,
+                            "version": item.version,
+                            "declaration_digest": item.declaration_digest,
+                        }
+                        for item in tool_snapshot.tools
+                    ],
+                    "security_policy_digest": self.security.policy.policy_digest,
+                    "security_policy_config": {
+                        "id": self.config.security_policy_id,
+                        "version": self.config.security_policy_version,
+                    },
+                }
+            ).encode()
         )
 
     def consolidate(
         self, normalized: Any, plan: Any, executions: tuple[Any, ...]
     ) -> Any:
-        return (
+        finding_set = (
             FindingProcessor()
             .process(
                 FindingProcessingRequest(
@@ -294,6 +445,45 @@ class _ConfiguredSteps:
                 )
             )
             .finding_set
+        )
+        for finding in finding_set.findings:
+            self._trace(
+                "finding.validated",
+                "finding",
+                {"finding_id": finding.finding_id, "trace_id": finding.trace_id},
+                f"finding-{finding.finding_id}",
+            )
+        return finding_set
+
+    def _trace_report(self) -> TraceReportView:
+        try:
+            events = self.trace_store.trace(self.task_id)
+        except ValueError:
+            events = ()
+        types = tuple(event.event_type for event in events)
+        return TraceReportView(
+            task_id=self.task_id,
+            event_count=len(events),
+            model_call_count=sum(item.startswith("model.call_") for item in types),
+            accepted_count=types.count("model.response_accepted"),
+            rejected_count=types.count("model.response_rejected"),
+            error_count=sum("failed" in item or "rejected" in item for item in types),
+            query_command=f"uv run code-review-agent trace show {self.task_id}",
+        )
+
+    def _budget_report(self) -> BudgetReportView:
+        summary = self.budget.get_summary(self.budget_account_id)
+        return BudgetReportView(
+            task_id=self.task_id,
+            authorized=summary.authorized,
+            known_consumption=summary.known_consumption,
+            uncertain_consumption=summary.uncertain_consumption,
+            active_reservations=summary.active_reservations,
+            remaining_budget=summary.remaining_budget,
+            overage=summary.overage,
+            authorization_deficit=summary.authorization_deficit,
+            account_state=summary.account_state.value,
+            ledger_version=summary.ledger_version,
         )
 
     def snapshot(
@@ -320,6 +510,8 @@ class _ConfiguredSteps:
                 if finding_set.findings
                 else "complete_no_findings"
             )
+        if self.trace_persistence_failed:
+            result_state = "partial"
         return ResultSnapshot(
             snapshot_id=f"snapshot-{self.task_id}",
             task_id=self.task_id,
@@ -329,19 +521,41 @@ class _ConfiguredSteps:
             input_binding=normalized.binding,
             review_plan=plan,
             finding_set=finding_set,
-            budget_summary=self.budget.get_summary(self.budget_account_id),
+            budget_summary=self._budget_report(),
             unknown_attempts=(),
-            trace_summary=SimpleNamespace(task_id=self.task_id),
+            trace_summary=self._trace_report(),
             checkpoint_id=f"boundary-{self.task_id}",
             subject=command.subject,
             security_summary="fixed local security policy",
+            failure_stage=(
+                "trace_persistence_failed" if self.trace_persistence_failed else None
+            ),
         )
 
     def report(self, snapshot: ResultSnapshot) -> Any:
+        self._trace(
+            "report.generation_started",
+            "report",
+            {"snapshot_id": snapshot.snapshot_id},
+            "report-generation-started",
+        )
+        if self.trace_persistence_failed and snapshot.result_state != "partial":
+            snapshot = replace(
+                snapshot,
+                result_state="partial",
+                failure_stage="trace_persistence_failed",
+            )
         return ReportBuilder().build(snapshot)
 
     def deliver(self, model: Any, target: Path) -> Any:
-        return MarkdownOutputAdapter().deliver(model, target)
+        delivery = MarkdownOutputAdapter().deliver(model, target)
+        self._trace(
+            "report.delivered",
+            "report",
+            {"delivered": True},
+            "report-delivered",
+        )
+        return delivery
 
 
 class ConfiguredRuntime:
@@ -375,9 +589,8 @@ class ConfiguredRuntime:
             model=model,
             budget_tokens=budget_tokens,
         )
-        policy = load_packaged_security_policy()
-        security = SecurityService(FixedSecurityScanner(), policy=policy)
-        budget = BudgetService()
+        security = self._new_security_service()
+        budget = self._new_budget_service()
         account = budget.create_account(
             command.task_id, budget_tokens, capability_ref="capability-1"
         )
@@ -387,7 +600,19 @@ class ConfiguredRuntime:
             budget=budget,
             account_id=account.account_id,
         )
-        return asyncio.run(self.tasks.start(command, ReviewDependencies(steps)))
+        result = asyncio.run(self.tasks.start(command, ReviewDependencies(steps)))
+        if steps.trace_persistence_failed:
+            result = replace(
+                result,
+                result_state="partial",
+                limitations=(
+                    result.limitations
+                    if "trace_persistence_failed" in result.limitations
+                    else tuple((*result.limitations, "trace_persistence_failed"))
+                ),
+            )
+            self.store.save(result)
+        return result
 
     def status(self, task_id: str) -> ReviewProgressView:
         from code_review_agent.application.query_service import ReviewQueryService
@@ -408,10 +633,20 @@ class ConfiguredRuntime:
         security = SecurityService(
             FixedSecurityScanner(), policy=load_packaged_security_policy()
         )
-        budget = BudgetService()
-        account = budget.create_account(
+        budget = self._new_budget_service()
+        account = budget.restore_account(
             task_id, budget_tokens, capability_ref="capability-1"
         )
+        for reservation_id in self.store.recover_pending_model_calls(task_id):
+            try:
+                budget.settle_uncertain_usage(
+                    reservation_id,
+                    usage_state=BudgetUsageState.MISSING,
+                    reason="model call started without a persisted terminal outcome",
+                )
+            except ValueError as exc:
+                if "already settled" not in str(exc):
+                    raise
         steps = self._build_steps(
             task_id=task_id,
             security=security,
@@ -449,7 +684,17 @@ class ConfiguredRuntime:
             provider=model_provider,
             tool_registry=ToolRegistry.from_builtin(),
             input_registry=_build_input_registry(security),
+            trace_store=self.store,
         )
+
+    @staticmethod
+    def _new_security_service() -> SecurityService:
+        return SecurityService(
+            FixedSecurityScanner(), policy=load_packaged_security_policy()
+        )
+
+    def _new_budget_service(self) -> BudgetService:
+        return BudgetService(self.store)
 
     def terminate(
         self, task_id: str, *, reason: str, expected_version: int

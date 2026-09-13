@@ -59,6 +59,7 @@ class LocalDiffReviewService:
             command,
             replace(
                 dependencies,
+                checkpoint_store=self.store or dependencies.checkpoint_store,
                 should_stop=lambda: (
                     dependencies.should_stop() or command.task_id in pause_requests
                 ),
@@ -96,7 +97,14 @@ class LocalDiffReviewService:
         if command is None or selected is None:
             raise ValueError("resume_context_not_found")
         self._pause_requests.discard(task_id)
-        return await self.start(command, selected)
+        return await self.start(
+            command,
+            replace(
+                selected,
+                resume=True,
+                confirm_unknown_retry=confirm_unknown_retry,
+            ),
+        )
 
     def terminate(self, task_id: str, *, reason: str) -> ReviewRunResult:
         if not reason:
@@ -132,7 +140,12 @@ class LocalDiffReviewService:
 
     def can_resume(self, task_id: str, *, confirm_unknown_retry: bool = False) -> bool:
         assert self._unknown_tasks is not None
-        if task_id in self._unknown_tasks and not confirm_unknown_retry:
+        persisted_unknown = self.store is not None and self.store.has_unknown_execution(
+            task_id
+        )
+        if (
+            task_id in self._unknown_tasks or persisted_unknown
+        ) and not confirm_unknown_retry:
             raise ValueError("unknown_retry_confirmation_required")
         return True
 
