@@ -74,9 +74,14 @@ class GuardedPublisher:
                             outcome_unknown=write,
                         )
                     buffered.extend(chunk)
+                decoded_headers = [
+                    (name, value)
+                    for name, value in streamed.headers.multi_items()
+                    if name.lower() not in {"content-encoding", "content-length"}
+                ]
                 return httpx.Response(
                     streamed.status_code,
-                    headers=streamed.headers,
+                    headers=decoded_headers,
                     content=bytes(buffered),
                     request=streamed.request,
                 )

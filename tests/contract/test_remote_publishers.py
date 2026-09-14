@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+
 import httpx
 import pytest
 import respx
@@ -213,3 +215,32 @@ def test_post_response_limit_stops_stream_before_buffering_rest() -> None:
 
     assert raised.value.code == "publication_result_unknown"
     assert raised.value.outcome_unknown is True
+
+
+def test_streamed_gzip_response_is_decoded_exactly_once() -> None:
+    compressed = gzip.compress(b'[{"id":8,"html_url":"https://g/c/8",'
+                               b'"body":"<!-- cr-agent:publication:summary -->"}]')
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        payload = (
+            compressed
+            if path.endswith("/issues/7/comments")
+            else gzip.compress(b"[]")
+        )
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            content=payload,
+            request=request,
+        )
+
+    publisher = GitHubPublisher(
+        Credentials(), client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    found = publisher.find_markers(
+        _target("github"), ("<!-- cr-agent:publication:summary -->",)
+    )
+
+    assert found["<!-- cr-agent:publication:summary -->"].remote_id == "8"
