@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -11,6 +13,7 @@ from code_review_agent.application.persistence import ReviewStateStore
 from code_review_agent.application.publication_service import PublicationService
 from code_review_agent.bootstrap import ConfiguredRuntime
 from code_review_agent.config import CliConfig
+from code_review_agent.domain.common.digests import sha256_digest
 from code_review_agent.domain.publication.models import (
     PublicationError,
     PublicationItem,
@@ -33,20 +36,22 @@ def _plan() -> PublicationPlan:
         "a" * 40,
         "b" * 40,
     )
+    line_body = "line body\n\n<!-- cr-agent:publication:line-key -->"
     line = PublicationItem(
         "line-key",
         PublicationItemKind.LINE,
-        "line body\n\n<!-- cr-agent:publication:line-key -->",
-        "1" * 64,
+        line_body,
+        sha256_digest(line_body),
         "<!-- cr-agent:publication:line-key -->",
         "finding-1",
         PublicationPosition("a.py", "a.py", "a.py", 2, "RIGHT"),
     )
+    summary_body = "summary\n\n<!-- cr-agent:publication:summary-key -->"
     summary = PublicationItem(
         "summary-key",
         PublicationItemKind.SUMMARY,
-        "summary\n\n<!-- cr-agent:publication:summary-key -->",
-        "2" * 64,
+        summary_body,
+        sha256_digest(summary_body),
         "<!-- cr-agent:publication:summary-key -->",
     )
     return PublicationPlan(
@@ -180,6 +185,32 @@ def test_publication_lease_excludes_concurrent_writer(tmp_path: Path) -> None:
         raise AssertionError("concurrent publication acquired the same lease")
 
 
+def test_stale_fencing_token_cannot_update_after_new_owner_acquires(
+    tmp_path: Path,
+) -> None:
+    store = ReviewStateStore(tmp_path / "state.sqlite3")
+    PublicationService(store, scan=lambda body, task: None).prepare(_plan())
+    first = store.acquire_publication_lease("task-1", "owner-1")
+    assert first
+    store.release_publication_lease("task-1", "owner-1")
+    second = store.acquire_publication_lease("task-1", "owner-2")
+    assert second and second > first
+
+    try:
+        store.update_publication_item(
+            "task-1",
+            "line-key",
+            state="succeeded",
+            owner_id="owner-1",
+            fencing_token=first,
+            expected_version=1,
+        )
+    except ValueError as exc:
+        assert str(exc) == "publication_fence_lost"
+    else:
+        raise AssertionError("stale owner updated publication state")
+
+
 def test_cleanup_removes_local_publication_state(tmp_path: Path) -> None:
     store = ReviewStateStore(tmp_path / "state.sqlite3")
     service = PublicationService(store, scan=lambda body, task: None)
@@ -240,6 +271,74 @@ def test_security_rejection_prevents_plan_persistence(tmp_path: Path) -> None:
         assert str(exc) == "publication_not_found"
     else:
         raise AssertionError("rejected publication was found")
+
+
+def test_security_redaction_rekeys_and_persists_only_sanitized_body(
+    tmp_path: Path,
+) -> None:
+    def redact(body: str, task_id: str) -> str:
+        return body.replace("line body", "safe body")
+
+    service = PublicationService(
+        ReviewStateStore(tmp_path / "state.sqlite3"), scan=redact
+    )
+
+    service.prepare(_plan())
+    stored = service.store.publication_plan("task-1")
+
+    assert stored.items[0].publication_key != "line-key"
+    assert "line body" not in stored.items[0].body
+    assert "safe body" in stored.items[0].body
+    assert stored.items[0].marker in stored.items[0].body
+
+
+def test_tampered_persisted_body_fails_integrity_before_network(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    service = _service(database)
+    service.prepare(_plan())
+    with sqlite3.connect(database) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT plan_json FROM review_publications WHERE task_id = ?",
+                ("task-1",),
+            ).fetchone()[0]
+        )
+        payload["items"][0]["body"] = "tampered body"
+        connection.execute(
+            "UPDATE review_publications SET plan_json = ? WHERE task_id = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), "task-1"),
+        )
+
+    try:
+        service.publish("task-1", Publisher())
+    except ValueError as exc:
+        assert str(exc) == "persistence_integrity_failed"
+    else:
+        raise AssertionError("tampered publish body reached publication")
+
+
+def test_publish_rescans_persisted_body_before_each_remote_write(
+    tmp_path: Path,
+) -> None:
+    preparing = True
+
+    def changing_policy(body: str, task_id: str) -> str:
+        return body if preparing else body.replace("line body", "redacted body")
+
+    service = PublicationService(
+        ReviewStateStore(tmp_path / "state.sqlite3"), scan=changing_policy
+    )
+    service.prepare(_plan())
+    preparing = False
+    publisher = Publisher()
+
+    result = service.publish("task-1", publisher)
+
+    assert result.state == "partial"
+    assert result.items[0].error_code == "publication_content_rejected"
+    assert publisher.created_keys == ["summary-key"]
 
 
 @respx.mock

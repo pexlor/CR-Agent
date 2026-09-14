@@ -168,10 +168,10 @@ class CliConfig:
 def _positive_decimal(
     value: object, error_code: str, *, max_decimal_places: int
 ) -> Decimal:
-    # Floats are rejected outright: TOML bare numeric literals (e.g. `20.000000000000001`)
-    # lose precision to IEEE754 binary rounding before they ever reach this function, which
-    # would silently defeat the decimal-place check below. Prices must be quoted strings
-    # (or plain ints) so the exact decimal digits survive intact.
+    # Floats are rejected outright: long TOML bare numeric literals lose precision
+    # to IEEE754 binary rounding before they reach this function, which would silently
+    # defeat the decimal-place check below. Prices must be quoted strings (or plain
+    # ints) so the exact decimal digits survive intact.
     if isinstance(value, bool) or not isinstance(value, (Decimal, str, int)):
         raise ValueError(error_code)
     try:

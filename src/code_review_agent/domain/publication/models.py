@@ -101,6 +101,7 @@ class PublicationItemResult:
     remote_id: str | None = None
     remote_url: str | None = None
     error_code: str | None = None
+    version: int = 1
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,10 +15,17 @@ CREATE TABLE IF NOT EXISTS review_publication_items (
     remote_id TEXT,
     remote_url TEXT,
     error_code TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
     UNIQUE(task_id, ordinal)
 );
 CREATE TABLE IF NOT EXISTS review_publication_leases (
     task_id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL,
     expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_publication_fences (
+    task_id TEXT PRIMARY KEY,
+    last_token INTEGER NOT NULL
 );

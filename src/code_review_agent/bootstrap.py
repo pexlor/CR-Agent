@@ -871,7 +871,7 @@ class ConfiguredRuntime:
         raise ValueError("publication_target_invalid")
 
     def _publication_service(self, security: SecurityService) -> PublicationService:
-        def scan(body: str, task_id: str) -> None:
+        def scan(body: str, task_id: str) -> str:
             descriptor = ArtifactDescriptor(
                 artifact_id="publication-" + sha256_bytes(body.encode()),
                 task_id=task_id,
@@ -883,8 +883,12 @@ class ConfiguredRuntime:
                 max_size=262_144,
             )
             prepared = security.evaluate_artifact(body, descriptor)
-            if prepared.decision is not SecurityDecision.SAFE:
+            if prepared.decision not in (
+                SecurityDecision.SAFE,
+                SecurityDecision.REDACTED,
+            ):
                 raise ValueError("publication_content_rejected")
+            return prepared.sanitized_payload
 
         return PublicationService(self.store, scan=scan)
 

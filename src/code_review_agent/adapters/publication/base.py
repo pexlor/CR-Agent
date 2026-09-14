@@ -42,27 +42,53 @@ class GuardedPublisher:
 
     def _get(self, url: str) -> httpx.Response:
         self._validate_url(url)
-        try:
-            response = self._client.get(url, headers=self._headers())
-        except httpx.HTTPError:
-            raise PublicationError("publication_provider_unavailable") from None
-        return self._validate_response(response, write=False)
+        return self._request("GET", url, write=False)
 
     def _post(self, url: str, payload: dict[str, object]) -> httpx.Response:
         self._validate_url(url)
+        content = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return self._request("POST", url, write=True, content=content)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        write: bool,
+        content: bytes | None = None,
+    ) -> httpx.Response:
         try:
-            response = self._client.post(
-                url,
-                headers=self._headers(),
-                content=json.dumps(
-                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8"),
-            )
+            with self._client.stream(
+                method, url, headers=self._headers(), content=content
+            ) as streamed:
+                self._validate_response(streamed, write=write)
+                buffered = bytearray()
+                for chunk in streamed.iter_bytes():
+                    if len(buffered) + len(chunk) > self._max_response_bytes:
+                        raise PublicationError(
+                            "publication_result_unknown"
+                            if write
+                            else "publication_provider_response_invalid",
+                            outcome_unknown=write,
+                        )
+                    buffered.extend(chunk)
+                return httpx.Response(
+                    streamed.status_code,
+                    headers=streamed.headers,
+                    content=bytes(buffered),
+                    request=streamed.request,
+                )
+        except PublicationError:
+            raise
         except httpx.HTTPError:
             raise PublicationError(
-                "publication_result_unknown", outcome_unknown=True
+                "publication_result_unknown"
+                if write
+                else "publication_provider_unavailable",
+                outcome_unknown=write,
             ) from None
-        return self._validate_response(response, write=True)
 
     def _validate_response(
         self, response: httpx.Response, *, write: bool
@@ -88,13 +114,6 @@ class GuardedPublisher:
             )
         if response.status_code >= 400:
             raise PublicationError("publication_provider_request_failed")
-        if len(response.content) > self._max_response_bytes:
-            raise PublicationError(
-                "publication_result_unknown"
-                if write
-                else "publication_provider_response_invalid",
-                outcome_unknown=write,
-            )
         return response
 
     def _json(self, response: httpx.Response, *, write: bool = False) -> Any:

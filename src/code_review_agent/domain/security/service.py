@@ -9,6 +9,7 @@ from uuid import uuid4
 from code_review_agent.domain.common.digests import sha256_bytes
 from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
+    ArtifactKind,
     ArtifactPurpose,
     PreparedSanitizedArtifact,
     SanitizedArtifactRef,
@@ -111,7 +112,15 @@ class SecurityService:
         sanitized = content
         categories: set[SensitiveCategory] = set()
         if any(action is SecurityDecision.REDACTED for action in actions):
-            sanitized, categories = self._redact(content, scan.findings)
+            sanitized, categories = self._redact(
+                content,
+                scan.findings,
+                protected_ranges=(
+                    _diff_path_metadata_ranges(content)
+                    if descriptor.kind is ArtifactKind.DIFF
+                    else ()
+                ),
+            )
             decision = SecurityDecision.REDACTED
         else:
             decision = SecurityDecision.SAFE
@@ -206,6 +215,8 @@ class SecurityService:
     def _redact(
         content: str,
         findings: tuple[SecurityFinding, ...],
+        *,
+        protected_ranges: tuple[tuple[int, int], ...] = (),
     ) -> tuple[str, set[SensitiveCategory]]:
         range_values: set[tuple[int, int, SensitiveCategory]] = set()
         for finding in findings:
@@ -217,9 +228,12 @@ class SecurityService:
                 match_start = content.find(matched, search_from)
                 if match_start < 0:
                     break
-                range_values.add(
-                    (match_start, match_start + len(matched), finding.category)
-                )
+                match_end = match_start + len(matched)
+                if not any(
+                    start <= match_start and match_end <= end
+                    for start, end in protected_ranges
+                ):
+                    range_values.add((match_start, match_end, finding.category))
                 search_from = match_start + len(matched)
         ranges = sorted(
             range_values, key=lambda item: (item[0], item[1], item[2].value)
@@ -253,3 +267,22 @@ class SecurityService:
     @property
     def policy(self) -> SecurityPolicy:
         return self._policy
+
+
+def _diff_path_metadata_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    in_metadata = False
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if body.startswith("diff --git "):
+            in_metadata = True
+            ranges.append((offset, offset + len(body)))
+        elif in_metadata and body.startswith("@@"):
+            in_metadata = False
+        elif in_metadata and body.startswith(
+            ("--- ", "+++ ", "rename from ", "rename to ", "Binary files ")
+        ):
+            ranges.append((offset, offset + len(body)))
+        offset += len(line)
+    return tuple(ranges)

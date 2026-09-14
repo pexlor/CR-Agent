@@ -35,6 +35,7 @@ from code_review_agent.domain.budget.models import (
     ReservationState,
     UsageState,
 )
+from code_review_agent.domain.common.digests import sha256_digest
 from code_review_agent.domain.publication.models import (
     PublicationItem,
     PublicationItemKind,
@@ -175,12 +176,19 @@ class ReviewStateStore:
                     remote_id TEXT,
                     remote_url TEXT,
                     error_code TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    fencing_token INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(task_id, ordinal)
                 );
                 CREATE TABLE IF NOT EXISTS review_publication_leases (
                     task_id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL,
                     expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_publication_fences (
+                    task_id TEXT PRIMARY KEY,
+                    last_token INTEGER NOT NULL
                 );
                 """
             )
@@ -193,6 +201,26 @@ class ReviewStateStore:
                 try:
                     connection.execute(
                         f"ALTER TABLE review_commands ADD COLUMN {column} {definition}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
+            for table, column, definition in (
+                ("review_publication_items", "version", "INTEGER NOT NULL DEFAULT 1"),
+                (
+                    "review_publication_items",
+                    "fencing_token",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "review_publication_leases",
+                    "fencing_token",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+            ):
+                try:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
                     )
                 except sqlite3.OperationalError as exc:
                     if "duplicate column name" not in str(exc):
@@ -237,6 +265,7 @@ class ReviewStateStore:
                             "remote_id": item.remote_id,
                             "remote_url": item.remote_url,
                             "error_code": item.error_code,
+                            "version": item.version,
                         }
                         for item in result.publication.items
                     ],
@@ -461,27 +490,43 @@ class ReviewStateStore:
     def publication_plan(self, task_id: str) -> PublicationPlan:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT plan_json FROM review_publications WHERE task_id = ?",
+                "SELECT publication_id, snapshot_id, snapshot_version, plan_json "
+                "FROM review_publications WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
         if row is None:
             raise ValueError("publication_not_found")
         try:
-            return self._decode_publication_plan(str(row[0]))
+            plan = self._decode_publication_plan(str(row[3]))
+            self._validate_publication_plan(plan)
+            if (
+                plan.task_id != task_id
+                or plan.publication_id != str(row[0])
+                or plan.snapshot_id != str(row[1])
+                or plan.snapshot_version != int(row[2])
+            ):
+                raise ValueError("publication_binding_invalid")
+            return plan
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("publication_plan_corrupt") from exc
+            raise ValueError("persistence_integrity_failed") from exc
 
     def publication_result(self, task_id: str) -> PublicationResult:
         plan = self.publication_plan(task_id)
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT publication_key, kind, state, remote_id, remote_url, "
-                "error_code FROM review_publication_items WHERE task_id = ? "
+                "error_code, version FROM review_publication_items WHERE task_id = ? "
                 "ORDER BY ordinal",
                 (task_id,),
             ).fetchall()
         if len(rows) != len(plan.items):
-            raise ValueError("publication_plan_corrupt")
+            raise ValueError("persistence_integrity_failed")
+        if any(
+            str(row[0]) != planned.publication_key
+            or str(row[1]) != planned.kind.value
+            for row, planned in zip(rows, plan.items, strict=True)
+        ):
+            raise ValueError("persistence_integrity_failed")
         items = tuple(
             PublicationItemResult(
                 publication_key=str(row[0]),
@@ -490,6 +535,7 @@ class ReviewStateStore:
                 remote_id=str(row[3]) if row[3] is not None else None,
                 remote_url=str(row[4]) if row[4] is not None else None,
                 error_code=str(row[5]) if row[5] is not None else None,
+                version=int(row[6]),
             )
             for row in rows
         )
@@ -514,22 +560,44 @@ class ReviewStateStore:
         remote_id: str | None = None,
         remote_url: str | None = None,
         error_code: str | None = None,
+        owner_id: str,
+        fencing_token: int,
+        expected_version: int,
     ) -> None:
         if state not in {"pending", "succeeded", "failed", "unknown"}:
             raise ValueError("publication_state_invalid")
+        now = datetime.now(UTC).isoformat()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 "UPDATE review_publication_items SET state = ?, remote_id = ?, "
-                "remote_url = ?, error_code = ? WHERE task_id = ? AND "
-                "publication_key = ?",
-                (state, remote_id, remote_url, error_code, task_id, publication_key),
+                "remote_url = ?, error_code = ?, version = version + 1, "
+                "fencing_token = ? WHERE task_id = ? AND publication_key = ? "
+                "AND version = ? AND EXISTS (SELECT 1 FROM "
+                "review_publication_leases lease WHERE lease.task_id = ? "
+                "AND lease.owner_id = ? AND lease.fencing_token = ? "
+                "AND lease.expires_at > ?)",
+                (
+                    state,
+                    remote_id,
+                    remote_url,
+                    error_code,
+                    fencing_token,
+                    task_id,
+                    publication_key,
+                    expected_version,
+                    task_id,
+                    owner_id,
+                    fencing_token,
+                    now,
+                ),
             )
             if cursor.rowcount != 1:
-                raise ValueError("publication_item_not_found")
+                raise ValueError("publication_fence_lost")
 
     def acquire_publication_lease(
         self, task_id: str, owner_id: str, *, seconds: int = 120
-    ) -> bool:
+    ) -> int | None:
         now = datetime.now(UTC)
         expiry = now + timedelta(seconds=seconds)
         with self._connect() as connection:
@@ -540,32 +608,59 @@ class ReviewStateStore:
                 (task_id, now.isoformat()),
             )
             cursor = connection.execute(
-                "INSERT OR IGNORE INTO review_publication_leases"
-                "(task_id, owner_id, expires_at) VALUES (?, ?, ?)",
-                (task_id, owner_id, expiry.isoformat()),
+                "SELECT 1 FROM review_publication_leases WHERE task_id = ?",
+                (task_id,),
             )
-            return cursor.rowcount == 1
+            if cursor.fetchone() is not None:
+                return None
+            row = connection.execute(
+                "SELECT last_token FROM review_publication_fences WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            token = (int(row[0]) if row is not None else 0) + 1
+            connection.execute(
+                "INSERT INTO review_publication_fences(task_id, last_token) "
+                "VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET "
+                "last_token = excluded.last_token",
+                (task_id, token),
+            )
+            connection.execute(
+                "INSERT INTO review_publication_leases"
+                "(task_id, owner_id, fencing_token, expires_at) VALUES (?, ?, ?, ?)",
+                (task_id, owner_id, token, expiry.isoformat()),
+            )
+            return token
 
-    def release_publication_lease(self, task_id: str, owner_id: str) -> None:
+    def release_publication_lease(
+        self, task_id: str, owner_id: str, fencing_token: int | None = None
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM review_publication_leases "
-                "WHERE task_id = ? AND owner_id = ?",
-                (task_id, owner_id),
+                "WHERE task_id = ? AND owner_id = ? "
+                "AND (? IS NULL OR fencing_token = ?)",
+                (task_id, owner_id, fencing_token, fencing_token),
             )
 
     def renew_publication_lease(
-        self, task_id: str, owner_id: str, *, seconds: int = 600
+        self,
+        task_id: str,
+        owner_id: str,
+        fencing_token: int,
+        *,
+        seconds: int = 600,
     ) -> bool:
         now = datetime.now(UTC)
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE review_publication_leases SET expires_at = ? "
-                "WHERE task_id = ? AND owner_id = ? AND expires_at > ?",
+                "WHERE task_id = ? AND owner_id = ? AND fencing_token = ? "
+                "AND expires_at > ?",
                 (
                     (now + timedelta(seconds=seconds)).isoformat(),
                     task_id,
                     owner_id,
+                    fencing_token,
                     now.isoformat(),
                 ),
             )
@@ -645,6 +740,21 @@ class ReviewStateStore:
             target=target,
             items=tuple(items),
         )
+
+    @staticmethod
+    def _validate_publication_plan(plan: PublicationPlan) -> None:
+        if not plan.task_id or not plan.snapshot_id or plan.snapshot_version <= 0:
+            raise ValueError("publication_identity_invalid")
+        for item in plan.items:
+            expected_marker = (
+                f"<!-- cr-agent:publication:{item.publication_key} -->"
+            )
+            if (
+                item.marker != expected_marker
+                or not item.body.endswith(f"\n\n{item.marker}")
+                or sha256_digest(item.body) != item.body_digest
+            ):
+                raise ValueError("publication_item_integrity_failed")
 
     def load_budget_state(
         self, task_id: str
@@ -1098,6 +1208,9 @@ class ReviewStateStore:
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM review_publication_leases WHERE task_id = ?", (task_id,)
+            )
+            connection.execute(
+                "DELETE FROM review_publication_fences WHERE task_id = ?", (task_id,)
             )
             connection.execute(
                 "DELETE FROM review_publication_items WHERE task_id = ?", (task_id,)

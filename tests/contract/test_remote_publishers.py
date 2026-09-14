@@ -194,3 +194,22 @@ def test_marker_listing_rejects_cross_origin_pagination() -> None:
         GitHubPublisher(Credentials()).find_markers(target, (_summary().marker,))
 
     assert raised.value.code == "publication_provider_response_invalid"
+
+
+def test_post_response_limit_stops_stream_before_buffering_rest() -> None:
+    class OversizedStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"x" * 11
+            raise AssertionError("response stream was consumed past the byte limit")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, stream=OversizedStream(), request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    publisher = GitHubPublisher(Credentials(), client=client, max_response_bytes=10)
+
+    with pytest.raises(PublicationError) as raised:
+        publisher.create_summary_comment(_target("github"), _summary())
+
+    assert raised.value.code == "publication_result_unknown"
+    assert raised.value.outcome_unknown is True

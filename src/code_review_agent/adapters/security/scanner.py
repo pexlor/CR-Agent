@@ -22,6 +22,7 @@ from detect_secrets.settings import transient_settings
 
 from code_review_agent.domain.security.models import (
     ArtifactDescriptor,
+    ArtifactKind,
     ArtifactPurpose,
     ScanResult,
     SecurityDecision,
@@ -81,7 +82,10 @@ _CERTIFICATE_BLOCK = re.compile(
     r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
     re.DOTALL,
 )
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_EMAIL = re.compile(
+    r"(?<![\w.+-])[A-Za-z0-9_]"
+    r"(?:[\w.+-]*[A-Za-z0-9_])?@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])"
+)
 _PHONE = re.compile(r"(?<!\d)(?:\+?86[ -]?)?1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?!\d)")
 _CN_ID = re.compile(r"(?<!\d)\d{17}[\dXx](?!\w)")
 _BUSINESS_BLOCK = re.compile(
@@ -115,7 +119,6 @@ class FixedSecurityScanner:
         descriptor: ArtifactDescriptor,
         policy: SecurityPolicy,
     ) -> ScanResult:
-        del descriptor
         if tuple(policy.detector_manifest) != FIXED_DETECTOR_MANIFEST:
             return ScanResult.indeterminate("scanner_incomplete")
         if not _policy_is_complete(policy):
@@ -132,6 +135,32 @@ class FixedSecurityScanner:
             started = time.monotonic()
             with _time_limit(timeout_ms), _SCAN_LOCK:
                 matches = tuple(_fixed_engine(content))
+                if descriptor.kind is ArtifactKind.DIFF:
+                    matches = tuple(
+                        _preserve_diff_control_prefix(content, match)
+                        for match in matches
+                    )
+                    protected = _diff_path_metadata_ranges(content)
+                    if any(
+                        match.category is not SensitiveCategory.UNKNOWN_SENSITIVE
+                        and any(
+                            start <= match.start and match.end <= end
+                            for start, end in protected
+                        )
+                        for match in matches
+                    ):
+                        return ScanResult.indeterminate("diff_path_sensitive")
+                    matches = tuple(
+                        match
+                        for match in matches
+                        if not (
+                            match.category is SensitiveCategory.UNKNOWN_SENSITIVE
+                            and any(
+                                start <= match.start and match.end <= end
+                                for start, end in protected
+                            )
+                        )
+                    )
             if (time.monotonic() - started) * 1000 > timeout_ms:
                 raise TimeoutError
         except TimeoutError:
@@ -198,6 +227,50 @@ def load_packaged_security_policy() -> SecurityPolicy:
 def _fixed_engine(content: str) -> tuple[DetectorMatch, ...]:
     matches = [*_detect_secrets_matches(content), *_custom_matches(content)]
     return tuple(matches)
+
+
+def _diff_path_metadata_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    in_metadata = False
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if body.startswith("diff --git "):
+            in_metadata = True
+            ranges.append((offset, offset + len(body)))
+        elif in_metadata and body.startswith("@@"):
+            in_metadata = False
+        elif in_metadata and body.startswith(
+            ("--- ", "+++ ", "rename from ", "rename to ", "Binary files ")
+        ):
+            ranges.append((offset, offset + len(body)))
+        offset += len(line)
+    return tuple(ranges)
+
+
+def _preserve_diff_control_prefix(
+    content: str, match: DetectorMatch
+) -> DetectorMatch:
+    if match.category is not SensitiveCategory.UNKNOWN_SENSITIVE:
+        return match
+    line_start = content.rfind("\n", 0, match.start) + 1
+    if match.start != line_start or content[match.start : match.start + 1] not in {
+        "+",
+        "-",
+        " ",
+    }:
+        return match
+    if match.end - match.start <= 1:
+        return match
+    return DetectorMatch(
+        detector_id=match.detector_id,
+        category=match.category,
+        start=match.start + 1,
+        end=match.end,
+        rule_id=match.rule_id,
+        confidence=match.confidence,
+        boundary_certain=match.boundary_certain,
+    )
 
 
 def _detect_secrets_matches(content: str) -> Iterator[DetectorMatch]:

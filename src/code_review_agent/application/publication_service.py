@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from uuid import uuid4
 
 from code_review_agent.application.persistence import ReviewStateStore
+from code_review_agent.domain.common.digests import sha256_digest
 from code_review_agent.domain.publication.models import (
     PublicationError,
     PublicationItemKind,
@@ -21,14 +23,44 @@ class PublicationService:
         self,
         store: ReviewStateStore,
         *,
-        scan: Callable[[str, str], None],
+        scan: Callable[[str, str], str | None],
     ) -> None:
         self.store = store
         self._scan = scan
 
     def prepare(self, plan: PublicationPlan) -> PublicationResult:
+        sanitized_items = []
         for item in plan.items:
-            self._scan(item.body, plan.task_id)
+            marker_suffix = f"\n\n{item.marker}"
+            if not item.body.endswith(marker_suffix):
+                raise ValueError("publication_content_invalid")
+            visible = item.body[: -len(marker_suffix)]
+            scanned = self._scan(visible, plan.task_id)
+            if scanned is None:
+                scanned = visible
+            if not isinstance(scanned, str) or not scanned:
+                raise ValueError("publication_content_rejected")
+            if scanned == visible:
+                sanitized_items.append(item)
+                continue
+            key = sha256_digest(
+                {
+                    "source_publication_key": item.publication_key,
+                    "sanitized_body": sha256_digest(scanned),
+                }
+            )
+            marker = f"<!-- cr-agent:publication:{key} -->"
+            body = scanned.rstrip() + f"\n\n{marker}"
+            sanitized_items.append(
+                replace(
+                    item,
+                    publication_key=key,
+                    marker=marker,
+                    body=body,
+                    body_digest=sha256_digest(body),
+                )
+            )
+        plan = replace(plan, items=tuple(sanitized_items))
         self.store.save_publication_plan(plan)
         event_id = f"publication-planned-{plan.publication_id}"
         self.store.append_trace_event(
@@ -53,17 +85,26 @@ class PublicationService:
         self, task_id: str, publisher: RemotePublisherPort
     ) -> PublicationResult:
         owner_id = str(uuid4())
-        if not self.store.acquire_publication_lease(
+        fencing_token = self.store.acquire_publication_lease(
             task_id, owner_id, seconds=600
-        ):
+        )
+        if fencing_token is None:
             raise PublicationError("publication_lease_held")
         try:
-            return self._publish_locked(task_id, publisher, owner_id)
+            return self._publish_locked(
+                task_id, publisher, owner_id, fencing_token
+            )
         finally:
-            self.store.release_publication_lease(task_id, owner_id)
+            self.store.release_publication_lease(
+                task_id, owner_id, fencing_token
+            )
 
     def _publish_locked(
-        self, task_id: str, publisher: RemotePublisherPort, operation_id: str
+        self,
+        task_id: str,
+        publisher: RemotePublisherPort,
+        operation_id: str,
+        fencing_token: int,
     ) -> PublicationResult:
         plan = self.store.publication_plan(task_id)
         current = self.store.publication_result(task_id)
@@ -82,12 +123,19 @@ class PublicationService:
         )
         if not remaining:
             return self._finish(current, operation_id, created, skipped)
-        self._renew(task_id, operation_id)
+        self._renew(task_id, operation_id, fencing_token)
         try:
             target_state = publisher.verify_target(plan.target)
         except PublicationError as exc:
             return self._finish(
-                self._fail_remaining(plan, remaining, exc.code, exc.outcome_unknown),
+                self._fail_remaining(
+                    plan,
+                    remaining,
+                    exc.code,
+                    exc.outcome_unknown,
+                    operation_id,
+                    fencing_token,
+                ),
                 operation_id,
                 created,
                 skipped,
@@ -95,7 +143,12 @@ class PublicationService:
         if not target_state.open:
             return self._finish(
                 self._fail_remaining(
-                    plan, remaining, "publication_target_closed", False
+                    plan,
+                    remaining,
+                    "publication_target_closed",
+                    False,
+                    operation_id,
+                    fencing_token,
                 ),
                 operation_id,
                 created,
@@ -104,7 +157,12 @@ class PublicationService:
         if target_state.head_sha != plan.target.head_sha:
             return self._finish(
                 self._fail_remaining(
-                    plan, remaining, "publication_target_changed", False
+                    plan,
+                    remaining,
+                    "publication_target_changed",
+                    False,
+                    operation_id,
+                    fencing_token,
                 ),
                 operation_id,
                 created,
@@ -119,7 +177,7 @@ class PublicationService:
         markers = tuple(
             item.marker for item in plan.items if item.publication_key in remaining
         )
-        self._renew(task_id, operation_id)
+        self._renew(task_id, operation_id, fencing_token)
         try:
             found = publisher.find_markers(plan.target, markers)
         except PublicationError as exc:
@@ -129,6 +187,8 @@ class PublicationService:
                     remaining,
                     exc.code,
                     exc.outcome_unknown,
+                    operation_id,
+                    fencing_token,
                     preserve_unknowns=True,
                 ),
                 operation_id,
@@ -152,13 +212,39 @@ class PublicationService:
                     state="succeeded",
                     remote_id=remote.remote_id,
                     remote_url=remote.url,
+                    owner_id=operation_id,
+                    fencing_token=fencing_token,
+                    expected_version=remaining[item.publication_key].version,
                 )
                 skipped += 1
                 self._trace_item(
                     task_id, operation_id, item.publication_key, "succeeded"
                 )
                 continue
-            self._renew(task_id, operation_id)
+            self._renew(task_id, operation_id, fencing_token)
+            visible = self._visible_body(item.body, item.marker)
+            try:
+                scanned = self._scan(visible, task_id)
+            except Exception:
+                scanned = ""
+            if scanned is not None and scanned != visible:
+                self.store.update_publication_item(
+                    task_id,
+                    item.publication_key,
+                    state="failed",
+                    error_code="publication_content_rejected",
+                    owner_id=operation_id,
+                    fencing_token=fencing_token,
+                    expected_version=remaining[item.publication_key].version,
+                )
+                self._trace_item(
+                    task_id,
+                    operation_id,
+                    item.publication_key,
+                    "failed",
+                    "publication_content_rejected",
+                )
+                continue
             try:
                 remote = (
                     publisher.create_line_comment(plan.target, item)
@@ -171,6 +257,9 @@ class PublicationService:
                     item.publication_key,
                     state="unknown" if exc.outcome_unknown else "failed",
                     error_code=exc.code,
+                    owner_id=operation_id,
+                    fencing_token=fencing_token,
+                    expected_version=remaining[item.publication_key].version,
                 )
                 self._trace_item(
                     task_id,
@@ -186,6 +275,9 @@ class PublicationService:
                 state="succeeded",
                 remote_id=remote.remote_id,
                 remote_url=remote.url,
+                owner_id=operation_id,
+                fencing_token=fencing_token,
+                expected_version=remaining[item.publication_key].version,
             )
             created += 1
             self._trace_item(task_id, operation_id, item.publication_key, "succeeded")
@@ -193,9 +285,18 @@ class PublicationService:
             self.store.publication_result(task_id), operation_id, created, skipped
         )
 
-    def _renew(self, task_id: str, owner_id: str) -> None:
-        if not self.store.renew_publication_lease(task_id, owner_id):
+    def _renew(self, task_id: str, owner_id: str, fencing_token: int) -> None:
+        if not self.store.renew_publication_lease(
+            task_id, owner_id, fencing_token
+        ):
             raise PublicationError("publication_lease_held")
+
+    @staticmethod
+    def _visible_body(body: str, marker: str) -> str:
+        suffix = f"\n\n{marker}"
+        if not body.endswith(suffix):
+            raise ValueError("persistence_integrity_failed")
+        return body[: -len(suffix)]
 
     def _fail_remaining(
         self,
@@ -203,6 +304,8 @@ class PublicationService:
         remaining: Mapping[str, PublicationItemResult],
         code: str,
         unknown: bool,
+        owner_id: str,
+        fencing_token: int,
         *,
         preserve_unknowns: bool = False,
     ) -> PublicationResult:
@@ -216,6 +319,9 @@ class PublicationService:
                     item.publication_key,
                     state="unknown" if unknown else "failed",
                     error_code=code,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    expected_version=prior.version,
                 )
         return self.store.publication_result(plan.task_id)
 
