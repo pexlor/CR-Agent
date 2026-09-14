@@ -76,6 +76,58 @@ def test_configured_runtime_completes_review_with_openai_provider(
 
 
 @respx.mock
+def test_runtime_sends_only_each_planned_work_unit_to_model(tmp_path: Path) -> None:
+    config = CliConfig(
+        state_database=tmp_path / "state-scoped.sqlite3",
+        provider_id="openai-compatible",
+        provider_version="1",
+        model_id="review-model",
+        provider_origin="https://api.example.com",
+        provider_path="/v1/chat/completions",
+        api_key="secret-token",
+        timeout_seconds=30,
+        max_response_bytes=1_048_576,
+        max_output_tokens=256,
+    )
+    route = respx.post("https://api.example.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"findings": []})}}
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+            },
+        )
+    )
+    sections = []
+    for index in range(3):
+        path = f"large_{index}.py"
+        sections.append(
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1 +1 @@\n"
+            f"-old_{index}_" + "x" * 15_000 + "\n"
+            f"+new_{index}_" + "y" * 15_000 + "\n"
+        )
+    command = StartReviewCommand(
+        task_id="task-scoped-model-input",
+        diff_text="".join(sections),
+        diff_file=None,
+        output_path=tmp_path / "reports" / "scoped.md",
+    )
+
+    result = ConfiguredRuntime(config).review(
+        command, "openai-compatible", "review-model", "request-scoped"
+    )
+
+    assert route.call_count == 3
+    assert result.result_state == "complete_no_findings"
+    assert all(len(call.request.content) < 50_000 for call in route.calls)
+
+
+@respx.mock
 def test_configured_runtime_does_not_report_provider_failure_as_no_findings(
     tmp_path: Path,
 ) -> None:

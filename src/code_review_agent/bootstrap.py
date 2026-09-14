@@ -337,6 +337,7 @@ class _ConfiguredSteps:
         return plan
 
     async def execute(self, unit: Any) -> WorkUnitExecutionResult:
+        unit_diff = self._work_unit_diff(unit)
         result = await WorkUnitExecutor().execute(
             ExecutionRequest(
                 task_id=self.task_id,
@@ -351,7 +352,7 @@ class _ConfiguredSteps:
                 tool_catalog=self.tool_registry,
                 tool_runtime=RestrictedToolRuntime(self.tool_registry),
                 system_rules="Review only the supplied change.",
-                diff_text=self.diff_text,
+                diff_text=unit_diff,
                 model_call_guard=self.trace_store,
             )
         )
@@ -425,6 +426,34 @@ class _ConfiguredSteps:
                 f"{result.execution_id}-budget",
             )
         return result
+
+    def _work_unit_diff(self, unit: Any) -> str:
+        if self.normalized is None:
+            raise ValueError("work_unit_input_not_normalized")
+        expected_artifact = self.normalized.change_set.sanitized_diff_ref
+        lines: list[str] = []
+        previous_end = -1
+        for reference in sorted(unit.content_refs, key=lambda item: item.start):
+            if (
+                reference.artifact != expected_artifact
+                or reference.start <= 0
+                or reference.start < previous_end
+                or reference.end > len(self.diff_text)
+            ):
+                raise ValueError("work_unit_content_ref_invalid")
+            prefix = self.diff_text[reference.start - 1 : reference.start]
+            content = self.diff_text[reference.start : reference.end]
+            if (
+                prefix not in {" ", "+", "-"}
+                or sha256_bytes(content.encode("utf-8"))
+                != reference.content_digest
+            ):
+                raise ValueError("work_unit_content_ref_invalid")
+            lines.append(prefix + content)
+            previous_end = reference.end
+        if not lines:
+            raise ValueError("work_unit_content_ref_invalid")
+        return "\n".join(lines) + "\n"
 
     def checkpoint_binding_digest(self, command: StartReviewCommand) -> str:
         capabilities = self.provider.capabilities
