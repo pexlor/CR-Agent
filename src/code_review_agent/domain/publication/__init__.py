@@ -1,0 +1,1 @@
+"""Remote review publication domain."""

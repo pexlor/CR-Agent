@@ -3,7 +3,9 @@ reports_dir = "reports"
 state_database = "state/reviews.sqlite3"
 
 [budget]
-default_tokens = 50000
+# Replace this example price with the configured model's actual blended price.
+max_cost_per_review_cny = "10.00"
+price_per_million_tokens_cny = "20.00"
 max_tokens = 1000000
 
 [provider]

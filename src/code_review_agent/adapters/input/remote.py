@@ -36,6 +36,7 @@ class RemoteRequest:
     base_sha: str
     head_sha: str
     diff: str
+    start_sha: str | None = None
 
 
 class RemoteDiffProvider:
@@ -112,6 +113,7 @@ class RemoteDiffProvider:
             object_number=request.object_number,
             base_sha=request.base_sha,
             head_sha=request.head_sha,
+            start_sha=request.start_sha,
             content_digest=sha256_bytes(encoded),
         )
         descriptor = ArtifactDescriptor(

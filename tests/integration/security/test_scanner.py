@@ -192,6 +192,88 @@ def test_scanner_is_deterministic_and_returns_no_secret_values(
     )
 
 
+def test_diff_security_scan_preserves_structural_paths_but_redacts_hunk_secret(
+    scanner: FixedSecurityScanner,
+) -> None:
+    path = "docs/superpowers/plans/2026-09-13-configured-monetary-budget-plan.md"
+    secret = "M9fK2pQ7xR4vN8zL1cH6jT3wY5uB0sDa"
+    content = (
+        f"diff --git a/{path} b/{path}\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        "@@ -0,0 +1,2 @@\n"
+        f"+See `{path}` for details.\n"
+        f"+opaque_blob = {secret}\n"
+    )
+    security = SecurityService(scanner, policy=load_packaged_security_policy())
+
+    prepared = security.evaluate_artifact(content, descriptor())
+
+    assert f"diff --git a/{path} b/{path}" in prepared.sanitized_payload
+    assert f"+++ b/{path}" in prepared.sanitized_payload
+    assert "+See `<REDACTED:UNKNOWN_SENSITIVE:" in prepared.sanitized_payload
+    assert secret not in prepared.sanitized_payload
+    assert "<REDACTED:UNKNOWN_SENSITIVE:" in prepared.sanitized_payload
+
+
+def test_diff_security_scan_does_not_treat_added_decorator_as_email(
+    scanner: FixedSecurityScanner,
+) -> None:
+    content = (
+        "diff --git a/test_a.py b/test_a.py\n"
+        "--- a/test_a.py\n"
+        "+++ b/test_a.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+@respx.mock\n"
+    )
+    security = SecurityService(scanner, policy=load_packaged_security_policy())
+
+    prepared = security.evaluate_artifact(content, descriptor())
+
+    assert prepared.sanitized_payload.endswith("+@respx.mock\n")
+
+
+def test_diff_security_scan_preserves_hunk_prefix_while_redacting_leading_token(
+    scanner: FixedSecurityScanner,
+) -> None:
+    token = "task_id=1234567890abcdef1234567890abcdef1234567890abcdef"
+    content = (
+        "diff --git a/report.md b/report.md\n"
+        "--- a/report.md\n"
+        "+++ b/report.md\n"
+        "@@ -0,0 +1 @@\n"
+        f"+{token} result=succeeded\n"
+    )
+    security = SecurityService(scanner, policy=load_packaged_security_policy())
+
+    prepared = security.evaluate_artifact(content, descriptor())
+
+    assert prepared.sanitized_payload.splitlines()[-1].startswith(
+        "+<REDACTED:UNKNOWN_SENSITIVE:"
+    )
+    assert token not in prepared.sanitized_payload
+
+
+def test_diff_path_false_positive_does_not_allow_same_token_in_hunk(
+    scanner: FixedSecurityScanner,
+) -> None:
+    token = "M9fK2pQ7xR4vN8zL1cH6jT3wY5uB0sDa"
+    content = (
+        f"diff --git a/{token} b/{token}\n"
+        f"--- a/{token}\n"
+        f"+++ b/{token}\n"
+        "@@ -0,0 +1 @@\n"
+        f"+value = {token}\n"
+    )
+    security = SecurityService(scanner, policy=load_packaged_security_policy())
+
+    prepared = security.evaluate_artifact(content, descriptor())
+
+    assert f"diff --git a/{token} b/{token}" in prepared.sanitized_payload
+    assert f"+value = {token}" not in prepared.sanitized_payload
+    assert "+value = <REDACTED:UNKNOWN_SENSITIVE:" in prepared.sanitized_payload
+
+
 def test_scanner_rejects_policy_manifest_mismatch(
     scanner: FixedSecurityScanner,
 ) -> None:

@@ -84,6 +84,7 @@ class InputIdentity:
     object_number: int | None = None
     base_sha: str | None = None
     head_sha: str | None = None
+    start_sha: str | None = None
     identity_digest: str = field(init=False)
     display_name: str = field(init=False)
 
@@ -94,21 +95,22 @@ class InputIdentity:
             raise ValueError("content digest must be lowercase SHA-256")
         if self.digest_algorithm != "sha256":
             raise ValueError("unsupported digest algorithm")
-        digest = sha256_digest(
-            {
-                "input_type": self.input_type,
-                "provider_id": self.provider_id,
-                "provider_version": self.provider_version,
-                "schema_version": self.schema_version,
-                "content_digest": self.content_digest,
-                "digest_algorithm": self.digest_algorithm,
-                "normalization_version": self.normalization_version,
-                "repository_identity": self.repository_identity,
-                "object_number": self.object_number,
-                "base_sha": self.base_sha,
-                "head_sha": self.head_sha,
-            }
-        )
+        identity_payload = {
+            "input_type": self.input_type,
+            "provider_id": self.provider_id,
+            "provider_version": self.provider_version,
+            "schema_version": self.schema_version,
+            "content_digest": self.content_digest,
+            "digest_algorithm": self.digest_algorithm,
+            "normalization_version": self.normalization_version,
+            "repository_identity": self.repository_identity,
+            "object_number": self.object_number,
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+        }
+        if self.start_sha is not None:
+            identity_payload["start_sha"] = self.start_sha
+        digest = sha256_digest(identity_payload)
         object.__setattr__(self, "identity_digest", digest)
         display_name = (
             f"plain diff {digest[:12]}"
@@ -140,6 +142,7 @@ class InputIdentity:
         base_sha: str,
         head_sha: str,
         content_digest: str,
+        start_sha: str | None = None,
         normalization_version: str = "remote_unified_diff_utf8_lf_v1",
     ) -> InputIdentity:
         return cls(
@@ -154,6 +157,7 @@ class InputIdentity:
             object_number=object_number,
             base_sha=base_sha,
             head_sha=head_sha,
+            start_sha=start_sha,
         )
 
 
@@ -592,11 +596,16 @@ class NormalizedInput:
         ):
             raise ValueError("input binding identity mismatch")
         if self.change_set.identity.input_type == PLAIN_DIFF_PROVIDER_ID:
-            if self.binding.base_sha is not None or self.binding.head_sha is not None:
+            if (
+                self.binding.base_sha is not None
+                or self.binding.head_sha is not None
+                or self.binding.start_sha is not None
+            ):
                 raise ValueError("plain diff binding cannot contain commit SHAs")
         elif (
             self.binding.base_sha != self.change_set.identity.base_sha
             or self.binding.head_sha != self.change_set.identity.head_sha
+            or self.binding.start_sha != self.change_set.identity.start_sha
         ):
             raise ValueError("remote binding commit SHA mismatch")
         if self.change_set.sanitized_diff_ref.task_id != self.binding.task_id:

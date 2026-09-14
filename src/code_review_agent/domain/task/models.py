@@ -147,6 +147,7 @@ class InputBinding:
     content_digest: str
     completeness_digest: str
     changeset_ref: str
+    start_sha: str | None = None
 
     def __post_init__(self) -> None:
         if not all(

@@ -16,6 +16,7 @@ from code_review_agent.domain.planning.models import (
     PlannedDisposition,
     PlanningStrategy,
     ReviewPlan,
+    ToolFailureImpact,
     WorkUnitKind,
 )
 from code_review_agent.domain.planning.planner import PlanningRequest, ReviewPlanner
@@ -24,6 +25,7 @@ from code_review_agent.domain.security.policy import SecurityPolicy
 from code_review_agent.domain.security.service import SecurityService
 from code_review_agent.domain.task.models import InputBinding, TaskSpec
 from code_review_agent.ports.tools import FixedToolReference, ToolRegistrySnapshot
+from tests.unit.tools.conftest import tool_manifest
 
 FIXTURES = Path("tests/fixtures/diffs")
 
@@ -319,3 +321,95 @@ def test_a_hunk_too_large_for_any_line_block_is_unreviewable() -> None:
     )
     assert scope.disposition is PlannedDisposition.UNREVIEWABLE
     assert scope.reason_code == "context_capacity_exceeded"
+
+
+def test_plan_assigns_enabled_tools_matching_the_file_language() -> None:
+    from code_review_agent.adapters.tools.registry import ToolRegistry
+    from code_review_agent.domain.task.models import TaskSpec as Spec
+
+    registry = ToolRegistry()
+    declaration = registry.register_toml(
+        tool_manifest(tool_id="dangerous-eval")
+    )[0]
+    text = FIXTURES.joinpath("basic.diff").read_text(encoding="utf-8")
+    normalized = _normalize(text)
+    spec = Spec(
+        spec_id="spec-tools",
+        input_intent="plain_diff",
+        provider_id="fake",
+        provider_version="1",
+        model_id="fake-model",
+        provider_origin="https://example.invalid",
+        ruleset_id="ruleset",
+        ruleset_version="1",
+        tools=(f"{declaration.tool_id}@{declaration.version}",),
+        security_policy_id="planning-test",
+        security_policy_version=1,
+        config_digest="a" * 64,
+        credential_alias="alias",
+        budget_account_id="budget-1",
+    )
+    request = PlanningRequest(
+        task_id="task-1",
+        task_spec=spec,
+        binding=normalized.binding,
+        change_set=normalized.change_set,
+        strategy=PlanningStrategy("file_first_v1", "1"),
+        model_capacity=_capacity(),
+        tool_catalog=_catalog(),
+        tool_declarations=(declaration,),
+    )
+
+    result = ReviewPlanner().plan(request)
+
+    unit = result.plan.work_units[0]
+    assert len(unit.tools) == 1
+    selection = unit.tools[0]
+    assert selection.fixed_reference.tool_id == "dangerous-eval"
+    assert selection.applicable_rule_ids == ("dangerous-eval",)
+    assert selection.failure_impact is ToolFailureImpact.EVIDENCE_DEGRADED
+    assert selection.order == 0
+    assert "python" in selection.applicability_reason
+
+
+def test_plan_skips_tools_not_enabled_or_for_other_languages() -> None:
+    from code_review_agent.adapters.tools.registry import ToolRegistry
+    from code_review_agent.domain.task.models import TaskSpec as Spec
+
+    registry = ToolRegistry()
+    declaration = registry.register_toml(
+        tool_manifest(tool_id="dangerous-eval")
+    )[0]
+    text = FIXTURES.joinpath("basic.diff").read_text(encoding="utf-8")
+    normalized = _normalize(text)
+    base = dict(
+        spec_id="spec-tools-none",
+        input_intent="plain_diff",
+        provider_id="fake",
+        provider_version="1",
+        model_id="fake-model",
+        provider_origin="https://example.invalid",
+        ruleset_id="ruleset",
+        ruleset_version="1",
+        security_policy_id="planning-test",
+        security_policy_version=1,
+        config_digest="a" * 64,
+        credential_alias="alias",
+        budget_account_id="budget-1",
+    )
+
+    def plan_with(tools: tuple[str, ...]) -> ReviewPlan:
+        request = PlanningRequest(
+            task_id="task-1",
+            task_spec=Spec(tools=tools, **base),
+            binding=normalized.binding,
+            change_set=normalized.change_set,
+            strategy=PlanningStrategy("file_first_v1", "1"),
+            model_capacity=_capacity(),
+            tool_catalog=_catalog(),
+            tool_declarations=(declaration,),
+        )
+        return ReviewPlanner().plan(request).plan
+
+    not_enabled = plan_with(("other-tool@1.0.0",))
+    assert not_enabled.work_units[0].tools == ()

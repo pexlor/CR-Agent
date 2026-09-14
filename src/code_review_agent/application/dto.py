@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from code_review_agent.domain.publication.models import PublicationResult
+
+type TraceSummaryScalar = str | int | float | bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +22,7 @@ class StartReviewCommand:
     provider: str = ""
     model: str = ""
     budget_tokens: int = 0
+    publish: bool = False
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -37,12 +43,73 @@ class TraceEventView:
 
 
 @dataclass(frozen=True, slots=True)
+class PersistedTraceArtifactView:
+    artifact_id: str
+    purpose: str
+    content: str
+    content_digest: str
+    security_decision: str
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedTraceEventView:
+    event_id: str
+    task_id: str
+    sequence: int
+    event_type: str
+    category: str
+    summary: Mapping[str, TraceSummaryScalar]
+    idempotency_key: str
+    created_at: str
+    expires_at: str
+    artifact: PersistedTraceArtifactView | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraceReportView:
+    task_id: str
+    event_count: int
+    model_call_count: int
+    accepted_count: int
+    rejected_count: int
+    error_count: int
+    query_command: str
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetReportView:
+    task_id: str
+    authorized: int
+    known_consumption: int
+    uncertain_consumption: int
+    active_reservations: int
+    remaining_budget: int
+    overage: int
+    authorization_deficit: int
+    account_state: str
+    ledger_version: int
+    currency: str
+    configured_cost_limit: str
+    price_per_million_tokens: str
+    authorized_cost: str
+    known_cost: str
+    uncertain_cost: str
+    active_reservations_cost: str
+    remaining_cost: str
+    overage_cost: str
+    authorization_deficit_cost: str
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewProgressView:
     task_id: str
     phase: str
     result_state: str
     delivery_state: str
     trace: tuple[TraceEventView, ...]
+    publication_state: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,3 +123,4 @@ class ReviewRunResult:
     report_digest: str | None
     limitations: tuple[str, ...] = ()
     trace: tuple[TraceEventView, ...] = ()
+    publication: PublicationResult | None = None

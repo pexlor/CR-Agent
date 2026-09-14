@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Protocol
 from uuid import uuid4
 
 from code_review_agent.domain.budget.ledger import BudgetLedger
@@ -23,10 +24,26 @@ from code_review_agent.domain.budget.models import (
 )
 
 
-class BudgetService:
-    """In-memory domain implementation used before the SQLite adapter exists."""
+class BudgetStateStore(Protocol):
+    def save_budget_state(
+        self,
+        account: BudgetAccount,
+        entries: tuple[BudgetLedgerEntry, ...],
+        reservations: tuple[BudgetReservation, ...],
+    ) -> None: ...
 
-    def __init__(self) -> None:
+    def load_budget_state(
+        self, task_id: str
+    ) -> tuple[
+        BudgetAccount, tuple[BudgetLedgerEntry, ...], tuple[BudgetReservation, ...]
+    ] | None: ...
+
+
+class BudgetService:
+    """Budget domain service with optional task-scoped durable state."""
+
+    def __init__(self, store: BudgetStateStore | None = None) -> None:
+        self._store = store
         self._accounts: dict[str, BudgetAccount] = {}
         self._entries: dict[str, list[BudgetLedgerEntry]] = {}
         self._reservations: dict[str, BudgetReservation] = {}
@@ -40,6 +57,11 @@ class BudgetService:
             or not 1 <= requested_tokens <= MAX_AUTHORIZATION
         ):
             raise ValueError("invalid_budget")
+        if (
+            self._store is not None
+            and self._store.load_budget_state(task_id) is not None
+        ):
+            raise ValueError("budget account already exists")
         account = BudgetAccount(
             account_id=str(uuid4()),
             task_id=task_id,
@@ -55,6 +77,36 @@ class BudgetService:
                 LedgerEntryType.AUTHORIZATION_INITIAL, requested_tokens, 1
             )
         ]
+        self._persist(account.account_id)
+        return account
+
+    def restore_account(
+        self, task_id: str, requested_tokens: int, *, capability_ref: str
+    ) -> BudgetAccount:
+        if self._store is None:
+            raise ValueError("budget state store is required")
+        state = self._store.load_budget_state(task_id)
+        if state is None:
+            raise ValueError("budget state not found")
+        account, entries, reservations = state
+        authorized = sum(
+            entry.amount
+            for entry in entries
+            if entry.entry_type
+            in (
+                LedgerEntryType.AUTHORIZATION_INITIAL,
+                LedgerEntryType.AUTHORIZATION_ADDED,
+            )
+        )
+        if authorized != requested_tokens:
+            raise ValueError("budget authorization mismatch")
+        if account.provider_capability_baseline_ref != capability_ref:
+            raise ValueError("provider_hard_budget_incompatible")
+        self._accounts[account.account_id] = account
+        self._entries[account.account_id] = list(entries)
+        for reservation in reservations:
+            self._reservations[reservation.reservation_id] = reservation
+            self._calls[reservation.model_call_id] = reservation.reservation_id
         return account
 
     def validate_initial_authorization(
@@ -118,6 +170,7 @@ class BudgetService:
         self._reservations[reservation.reservation_id] = reservation
         self._calls[model_call_id] = reservation.reservation_id
         self._append(account_id, LedgerEntryType.RESERVATION_CREATED, amount)
+        self._persist(account_id)
         return reservation
 
     def release_unsent_reservation(self, reservation_id: str) -> BudgetReservation:
@@ -132,6 +185,7 @@ class BudgetService:
             reservation.amount,
             reservation_amount=reservation.amount,
         )
+        self._persist(reservation.account_id)
         return updated
 
     def settle_known_usage(
@@ -170,6 +224,7 @@ class BudgetService:
             )
             self._accounts[account.account_id] = frozen
             self._append(account.account_id, LedgerEntryType.FREEZE_APPLIED, 0)
+        self._persist(reservation.account_id)
         return BudgetSettlement(updated, actual, overage)
 
     def settle_uncertain_usage(
@@ -207,6 +262,7 @@ class BudgetService:
             self._accounts[account.account_id] = replace(
                 account, pending_revalidation=True, revision=account.revision + 1
             )
+        self._persist(reservation.account_id)
         return updated
 
     def add_authorization(self, account_id: str, amount: int) -> BudgetAccount:
@@ -219,6 +275,7 @@ class BudgetService:
         self._append(account_id, LedgerEntryType.AUTHORIZATION_ADDED, amount)
         updated = replace(account, revision=account.revision + 1)
         self._accounts[account_id] = updated
+        self._persist(account_id)
         return updated
 
     def evaluate_unfreeze(
@@ -248,6 +305,7 @@ class BudgetService:
                 revision=account.revision + 1,
             )
             self._append(account_id, LedgerEntryType.FREEZE_CLEARED, 0)
+            self._persist(account_id)
         return True
 
     def get_summary(
@@ -316,3 +374,16 @@ class BudgetService:
             revision=account.revision + 1,
         )
         return entry
+
+    def _persist(self, account_id: str) -> None:
+        if self._store is None:
+            return
+        account = self._account(account_id)
+        reservations = tuple(
+            reservation
+            for reservation in self._reservations.values()
+            if reservation.account_id == account_id
+        )
+        self._store.save_budget_state(
+            account, tuple(self._entries[account_id]), reservations
+        )

@@ -6,13 +6,29 @@ from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
-from code_review_agent.application.dto import ReviewProgressView, ReviewRunResult
+from code_review_agent.application.dto import (
+    ReviewProgressView,
+    ReviewRunResult,
+    StartReviewCommand,
+)
 from code_review_agent.cli.app import create_app
+from code_review_agent.domain.publication.models import PublicationResult
 
 
 class FakeRuntime:
     def __init__(self) -> None:
-        self.review_calls: list[tuple[object, str, str, int, str | None]] = []
+        self.review_calls: list[tuple[StartReviewCommand, str, str, str | None]] = []
+        self.publish_calls: list[str] = []
+        self.publication = PublicationResult(
+            task_id="task-1",
+            publication_id="publication-1",
+            state="succeeded",
+            published=2,
+            skipped=0,
+            failed=0,
+            unknown=0,
+            items=(),
+        )
         self.result = ReviewRunResult(
             task_id="task-1",
             session_id="session-1",
@@ -25,13 +41,12 @@ class FakeRuntime:
 
     def review(
         self,
-        command: object,
+        command: StartReviewCommand,
         provider: str,
         model: str,
-        budget_tokens: int,
         request_id: str | None,
     ) -> ReviewRunResult:
-        self.review_calls.append((command, provider, model, budget_tokens, request_id))
+        self.review_calls.append((command, provider, model, request_id))
         return self.result
 
     def status(self, task_id: str) -> ReviewProgressView:
@@ -70,6 +85,10 @@ class FakeRuntime:
         assert expected_version == 1
         return self.result
 
+    def publish(self, task_id: str) -> PublicationResult:
+        self.publish_calls.append(task_id)
+        return self.publication
+
     def providers(self) -> tuple[dict[str, str], ...]:
         return ({"kind": "input", "provider_id": "fake", "version": "1"},)
 
@@ -95,7 +114,7 @@ def test_review_requires_exactly_one_input_source() -> None:
     assert runtime.review_calls == []
 
 
-def test_review_rejects_invalid_budget_without_calling_application() -> None:
+def test_review_rejects_removed_token_budget_option() -> None:
     runtime = FakeRuntime()
     result = CliRunner().invoke(
         create_app(lambda: runtime),
@@ -113,6 +132,7 @@ def test_review_rejects_invalid_budget_without_calling_application() -> None:
     )
 
     assert result.exit_code == 2
+    assert "No such option" in result.output
     assert runtime.review_calls == []
 
 
@@ -139,7 +159,88 @@ def test_review_json_uses_final_result_on_stdout(tmp_path: Path) -> None:
     assert payload["ok"] is True
     assert payload["data"]["task_id"] == "task-1"
     assert result.stderr == ""
-    assert runtime.review_calls[0][3] == 50_000
+    assert runtime.review_calls[0][3] == "request-1"
+
+
+def test_review_publish_flag_is_explicitly_forwarded(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    result = CliRunner().invoke(
+        create_app(lambda: runtime),
+        [
+            "review",
+            "--url",
+            "https://github.com/owner/repo/pull/7",
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--publish",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert runtime.review_calls[0][0].publish is True
+
+
+def test_review_publish_rejects_local_diff_before_runtime_call(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+
+    result = CliRunner().invoke(
+        create_app(lambda: runtime),
+        [
+            "review",
+            "--diff-file",
+            str(tmp_path / "change.diff"),
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--publish",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--publish requires --url" in result.stderr
+    assert runtime.review_calls == []
+
+
+def test_publish_requires_confirm_and_returns_structured_result() -> None:
+    runtime = FakeRuntime()
+    runner = CliRunner()
+
+    blocked = runner.invoke(create_app(lambda: runtime), ["publish", "task-1"])
+    published = runner.invoke(
+        create_app(lambda: runtime),
+        ["publish", "task-1", "--confirm", "--json", "--request-id", "req-pub"],
+    )
+
+    assert blocked.exit_code == 2
+    assert runtime.publish_calls == ["task-1"]
+    assert published.exit_code == 0
+    payload = json.loads(published.stdout)
+    assert payload["command"] == "publish"
+    assert payload["data"]["state"] == "succeeded"
+
+
+def test_publish_returns_delivery_failure_for_partial_remote_result() -> None:
+    runtime = FakeRuntime()
+    runtime.publication = PublicationResult(
+        task_id="task-1",
+        publication_id="publication-1",
+        state="partial",
+        published=1,
+        skipped=0,
+        failed=1,
+        unknown=0,
+        items=(),
+    )
+
+    result = CliRunner().invoke(
+        create_app(lambda: runtime), ["publish", "task-1", "--confirm", "--json"]
+    )
+
+    assert result.exit_code == 9
+    assert json.loads(result.stdout)["data"]["state"] == "partial"
 
 
 def test_status_and_trace_show_use_shared_output_contract() -> None:

@@ -47,6 +47,7 @@ from code_review_agent.domain.security.models import (
     ArtifactKind,
     ArtifactPurpose,
     ArtifactSource,
+    SanitizedArtifactRef,
     TrustLabel,
 )
 from code_review_agent.domain.security.service import SecurityService
@@ -104,6 +105,7 @@ class ExecutionRequest:
     diff_text: str
     tool_runtime: RestrictedToolRuntimePort | None = None
     execution_id: str = field(default_factory=lambda: str(uuid4()))
+    model_call_guard: object | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -178,6 +180,30 @@ class WorkUnitExecutor:
                 error_code="security_boundary_failed",
             )
 
+        request_ref = self._prepare_trace_artifact(
+            request,
+            prepared.body.decode("utf-8", errors="replace"),
+            artifact_id=f"trace-model-request-{request.execution_id}",
+            purpose=ArtifactPurpose.TRACE_MODEL_REQUEST,
+            source=ArtifactSource.TRUSTED_APPLICATION,
+        )
+        if request_ref is None:
+            gateway.discard_prepared(request.model_provider, prepared)
+            return WorkUnitExecutionResult(
+                execution_id=request.execution_id,
+                task_id=request.task_id,
+                work_unit_id=request.work_unit.work_unit_id,
+                plan_id=request.work_unit.plan_id,
+                attempt_number=request.attempt_number,
+                state=WorkUnitExecutionState.PARTIAL,
+                coverage_impact=CoverageImpact.DEGRADED,
+                tool_attempts=tool_attempts,
+                model_attempt=None,
+                model_outcome_kind=ModelAttemptOutcomeKind.NOT_ATTEMPTED,
+                candidates=(),
+                error_code="trace_persistence_failed",
+            )
+
         capability = ProviderHardBudgetCapability(
             capability_id="capability-1",
             provider_id=prepared.provider_id,
@@ -217,10 +243,55 @@ class WorkUnitExecutor:
                 error_code="budget_reservation_rejected",
             )
 
+        guard = request.model_call_guard
+        if guard is not None:
+            try:
+                guard.begin_model_call(  # type: ignore[attr-defined]
+                    task_id=request.task_id,
+                    model_call_id=model_call_id,
+                    work_unit_id=request.work_unit.work_unit_id,
+                    execution_id=request.execution_id,
+                    reservation_id=reservation.reservation_id,
+                    request_digest=prepared.body_digest,
+                )
+            except Exception:
+                gateway.discard_prepared(request.model_provider, prepared)
+                request.budget_service.release_unsent_reservation(
+                    reservation.reservation_id
+                )
+                return WorkUnitExecutionResult(
+                    execution_id=request.execution_id,
+                    task_id=request.task_id,
+                    work_unit_id=request.work_unit.work_unit_id,
+                    plan_id=request.work_unit.plan_id,
+                    attempt_number=request.attempt_number,
+                    state=WorkUnitExecutionState.PARTIAL,
+                    coverage_impact=CoverageImpact.DEGRADED,
+                    tool_attempts=tool_attempts,
+                    model_attempt=None,
+                    model_outcome_kind=ModelAttemptOutcomeKind.NOT_ATTEMPTED,
+                    candidates=(),
+                    error_code="trace_persistence_failed",
+                )
+
         outcome = await gateway.send(
             request.model_provider, prepared, reservation=reservation
         )
         self._settle(request.budget_service, reservation, outcome)
+        if guard is not None:
+            guard.finish_model_call(  # type: ignore[attr-defined]
+                model_call_id,
+                terminal_state=outcome.state.provider_state.value,
+            )
+        response_ref = None
+        if outcome.response_payload is not None:
+            response_ref = self._prepare_trace_artifact(
+                request,
+                canonical_json(dict(outcome.response_payload)),
+                artifact_id=f"trace-model-response-{request.execution_id}",
+                purpose=ArtifactPurpose.TRACE_MODEL_RESPONSE,
+                source=ArtifactSource.MODEL_RESPONSE,
+            )
 
         model_attempt = ModelCallAttempt(
             model_call_id=model_call_id,
@@ -228,8 +299,8 @@ class WorkUnitExecutor:
             execution_id=request.execution_id,
             provider_id=prepared.provider_id,
             model_id=prepared.model_id,
-            request_ref=None,
-            response_ref=None,
+            request_ref=request_ref,
+            response_ref=response_ref,
             reservation_id=reservation.reservation_id,
             outcome=outcome,
         )
@@ -393,7 +464,9 @@ class WorkUnitExecutor:
             "Return exactly one JSON object with one top-level field: "
             '"findings". "findings" must always be an array; use an empty '
             "array when there are no valid findings. Do not return summary, "
-            "markdown, prose, or any other top-level field."
+            "markdown, prose, or any other top-level field. Write all "
+            "human-readable finding content in Simplified Chinese, while "
+            "keeping JSON property names exactly as defined by the schema."
         )
         return PromptEnvelope(
             system_rules=f"{request.system_rules} {output_contract}",
@@ -422,6 +495,29 @@ class WorkUnitExecutor:
         with suppress(Exception):
             prepared = request.security_service.evaluate_artifact(text, descriptor)
         return prepared is not None and prepared.decision.value in ("safe", "redacted")
+
+    @staticmethod
+    def _prepare_trace_artifact(
+        request: ExecutionRequest,
+        content: str,
+        *,
+        artifact_id: str,
+        purpose: ArtifactPurpose,
+        source: ArtifactSource,
+    ) -> SanitizedArtifactRef | None:
+        descriptor = ArtifactDescriptor(
+            artifact_id=artifact_id,
+            task_id=request.task_id,
+            source=source,
+            trust_label=TrustLabel.UNTRUSTED_TEXT,
+            kind=ArtifactKind.TRACE_PAYLOAD,
+            purpose=purpose,
+        )
+        try:
+            prepared = request.security_service.evaluate_artifact(content, descriptor)
+            return request.security_service.commit(prepared)
+        except Exception:
+            return None
 
     def _settle(
         self,

@@ -30,7 +30,7 @@ Limitation: {{ limitation }}
 ### {{ finding.title }}
 
 - ID: `{{ finding.finding_id }}`
-- Location: `{{ finding.location.kind.value }} `{{ finding.location.file_id }}`{% if finding.location.line %}:{{ finding.location.line }}{% endif %}
+- Location: `{{ finding.location.kind.value }} {{ finding.location.file_id }}{% if finding.location.line %}:{{ finding.location.line }}{% endif %}`
 - Severity: `{{ finding.severity }}`
 - Confidence: `{{ finding.confidence.value }}`
 - Problem: {{ finding.problem }}
@@ -45,8 +45,35 @@ Limitation: {{ limitation }}
 
 ## Budget
 
-{{ budget }}
+| Metric | Tokens / CNY / Value |
+| --- | --- |
+| Authorized | {{ budget.authorized | default(0) }} token |
+| Known consumption | {{ budget.known_consumption | default(0) }} token |
+| Uncertain consumption | {{ budget.uncertain_consumption | default(0) }} token |
+| Active reservations | {{ budget.active_reservations | default(0) }} token |
+| Remaining | {{ budget.remaining_budget | default(0) }} token |
+| Overage | {{ budget.overage | default(0) }} token |
+| Authorization deficit | {{ budget.authorization_deficit | default(0) }} token |
+| Account state | {{ budget.account_state | default("unknown") }} |
+| Ledger version | {{ budget.ledger_version }} |
+| Configured cost limit | {{ budget.configured_cost_limit | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Price per million tokens | {{ budget.price_per_million_tokens | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Authorized cost | {{ budget.authorized_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Known cost | {{ budget.known_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Uncertain cost | {{ budget.uncertain_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Active reservations cost | {{ budget.active_reservations_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Remaining cost | {{ budget.remaining_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Overage cost | {{ budget.overage_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
+| Authorization deficit cost | {{ budget.authorization_deficit_cost | default("unavailable") }} {{ budget.currency | default("CNY") }} |
 
 ## Trace
 
-{{ trace }}
+| Metric | Count |
+| --- | --- |
+| Event count | {{ trace.event_count | default(0) }} |
+| Model calls | {{ trace.model_call_count | default(0) }} |
+| Accepted | {{ trace.accepted_count | default(0) }} |
+| Rejected | {{ trace.rejected_count | default(0) }} |
+| Errors | {{ trace.error_count | default(0) }} |
+
+Full trace: `uv run code-review-agent trace show {{ task_id }}`

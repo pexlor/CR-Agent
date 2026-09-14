@@ -28,8 +28,5 @@ def create_app(
     return build_commands(runtime_factory, config=config)
 
 
-app = create_app()
-
-
 def main() -> None:
-    app()
+    create_app()()
